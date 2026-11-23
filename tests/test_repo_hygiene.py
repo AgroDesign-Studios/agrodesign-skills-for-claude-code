@@ -26,7 +26,7 @@ def repo_files() -> list[Path]:
 class HygieneCases(unittest.TestCase):
     def test_skills_have_frontmatter_named_after_their_folder(self) -> None:
         skills = sorted((ROOT / "skills").iterdir())
-        self.assertEqual([s.name for s in skills], ["agrodesign-deep-review", "agrodesign-github-upload"])
+        self.assertEqual([s.name for s in skills], ["agrodesign-deep-review", "agrodesign-github-publish"])
         for skill in skills:
             text = (skill / "SKILL.md").read_text(encoding="utf-8")
             m = re.match(r"---\nname: ([a-z0-9-]+)\ndescription: (.+?)\n---\n", text, re.S)

@@ -1,4 +1,4 @@
-# /agrodesign-github-upload — brief templates
+# /agrodesign-github-publish — brief templates
 
 Fill `<run>` with the run directory and `<DIGEST>` with the set's digest. Every brief is self-contained: no reviewer sees this conversation or another reviewer's findings (Step 5 excepted). If your project has its own probe rules (for example "every database URL here is production"), add them to the Rules paragraph of Stages 2 and 5; they may only add restrictions.
 

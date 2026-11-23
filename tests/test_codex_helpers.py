@@ -136,7 +136,7 @@ class CodexReviewCases(UploadCase):
         self.assertFalse(self.answer().exists())
 
     def test_missing_gitleaks_sends_nothing(self) -> None:
-        self.codex_env["AGRODESIGN_GITHUB_UPLOAD_GITLEAKS_BIN"] = str(self.tmp / "no-such-gitleaks")
+        self.codex_env["AGRODESIGN_GITHUB_PUBLISH_GITLEAKS_BIN"] = str(self.tmp / "no-such-gitleaks")
         self.codex_env["PATH"] = f"{self.codex.parent}:/usr/bin:/bin"
         got = self.run_codex(str(self.brief))
         if shutil.which("gitleaks", path="/usr/bin:/bin"):

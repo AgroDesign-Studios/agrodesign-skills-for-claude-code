@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # codex_review.sh — one read-only Codex read of a brief, answered into a file
-# (the agrodesign-github-upload skill, Step 3).
+# (the agrodesign-github-publish skill, Step 3).
 #
 #   bash codex_review.sh [--root DIR]... [--deny PATH]... <run>/stage3-codex-NN.md
 #
@@ -22,7 +22,7 @@
 # the run's rollout log to show the requested model served it.
 #
 # BRIEF SCAN. The brief leaves the machine for an outside provider, so it is scanned
-# first: gitleaks (AGRODESIGN_GITHUB_UPLOAD_GITLEAKS_BIN or PATH; required) with its default rules
+# first: gitleaks (AGRODESIGN_GITHUB_PUBLISH_GITLEAKS_BIN or PATH; required) with its default rules
 # only — no config, ignore file, allow comment or GITLEAKS_* variable can weaken it —
 # and high-precision key and token patterns, and a URL that carries a password. A hit,
 # a missing gitleaks or a scanner that fails sends nothing and exits 9; there is no
@@ -136,7 +136,7 @@ fi
 SECRET_CONTENT_RE='-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----|(^|[^0-9A-Za-z_-])(gh[pousr]_[0-9A-Za-z]{30,}|github_pat_[0-9A-Za-z_]{30,}|sk-ant-[0-9A-Za-z_-]{20,}|sk-[0-9A-Za-z_-]{32,}|xai-[0-9A-Za-z]{32,}|AIza[0-9A-Za-z_-]{35}|AKIA[0-9A-Z]{16}|xox[abposr]-[0-9A-Za-z-]{10,}|eyJ[0-9A-Za-z_-]{10,}\.eyJ[0-9A-Za-z_-]{10,}\.[0-9A-Za-z_-]{5,})'
 URL_PASSWORD_RE='[A-Za-z][A-Za-z0-9+.-]*://[^/:@[:space:]]+:[^/@[:space:]]{3,}@'
 BRIEF_HIT=""
-GITLEAKS_BIN="${AGRODESIGN_GITHUB_UPLOAD_GITLEAKS_BIN:-$(command -v gitleaks || true)}"
+GITLEAKS_BIN="${AGRODESIGN_GITHUB_PUBLISH_GITLEAKS_BIN:-$(command -v gitleaks || true)}"
 if [ -z "$GITLEAKS_BIN" ] || [ ! -x "$GITLEAKS_BIN" ]; then
   BRIEF_HIT="gitleaks-missing"
 else

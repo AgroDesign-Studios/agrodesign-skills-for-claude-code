@@ -107,7 +107,7 @@ class GrokCases(UploadCase):
         self.assertEqual(call["cwd_list"], [], "grok ran in an empty folder")
         self.assertEqual(call["home_list"], [], "with an empty HOME")
         self.assertNotEqual(call["home"], str(Path.home()))
-        self.assertNotIn("AGRODESIGN_GITHUB_UPLOAD_GITLEAKS_BIN", call["env"])
+        self.assertNotIn("AGRODESIGN_GITHUB_PUBLISH_GITLEAKS_BIN", call["env"])
         payload = json.loads(out.read_text())
         self.assertEqual(payload["digest"], self.digest(run))
         self.assertEqual(payload["cost_usd"], 0.0123)

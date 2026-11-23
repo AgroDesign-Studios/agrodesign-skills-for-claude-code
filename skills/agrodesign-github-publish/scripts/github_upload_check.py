@@ -1,29 +1,46 @@
 #!/usr/bin/env python3
-"""github_upload_check.py — stage, scan, bundle, gate, seal and push an upload set
-that goes to a public place on GitHub (the agrodesign-github-upload skill).
+"""github_upload_check.py — stage, scan, bundle, gate and seal what goes to a public
+place on GitHub; then, each only after the owner's recorded approval, push the checked
+commit, read everything a switch to public would expose, switch, and release (the
+agrodesign-github-publish skill).
 
-  stage  --out RUN SOURCE...
-  scan   --run RUN [--values-file FILE]
-  bundle --run RUN [--max-bytes N]
-  gate   --run RUN --before codex|grok
-  seal   --run RUN
-  verify --run RUN SOURCE...
-  push   --run RUN SOURCE...
+  stage     --out RUN SOURCE...
+  scan      --run RUN [--values-file FILE]
+  bundle    --run RUN [--max-bytes N]
+  gate      --run RUN --before codex|grok
+  seal      --run RUN
+  verify    --run RUN SOURCE...
+  approve   --run RUN --step push|publish|release --repo OWNER/NAME --words TEXT
+            [--valid-minutes N] [--release-tag TAG --release-target COMMIT
+            --release-title FILE --release-notes FILE [--release-asset FILE]...]
+  revoke    --run RUN --step push|publish|release --words TEXT
+  push      --run RUN SOURCE...
+  preflight --run RUN --repo OWNER/NAME
+  publish   --run RUN --repo OWNER/NAME [--release-title FILE --release-notes FILE
+            [--release-asset FILE]...]
+  state     --run RUN --repo OWNER/NAME
 
 SOURCE is any mix, given in the same order to stage, verify and push:
   --tree DIR                      a directory's files as they will appear (a `.git`
                                   inside is skipped; directory symlinks are recorded,
                                   not followed)
-  --git REPO --push REMOTE REF    what `git push REMOTE REF` would send: every object
+  --git REPO --push REMOTE REF [--whole-history]
+                                  what `git push REMOTE REF` would send: every object
                                   the destination's refs (git ls-remote) do not
                                   already reach — each blob with its path, each raw
                                   commit (message, author, committer, signatures,
                                   merge tags) and an annotated tag's own object. A new
                                   or empty destination therefore stages the whole
-                                  history. The clone must hold every commit the
-                                  destination has (fetch it first).
+                                  history; --whole-history stages it whatever the
+                                  destination holds (required before a switch to
+                                  public). What the destination held is recorded, and
+                                  verify and push re-stage against that record, so a
+                                  verify after the push still matches. The clone must
+                                  hold every commit the destination has (fetch first).
   --file PATH                     one loose file: a release asset, the release title
                                   and the release notes (each written to a file)
+  --repo-meta OWNER/NAME          the repository's description, homepage and topics
+                                  (read with gh), public once the repository is
 
 `stage` copies the set into RUN/tree (never under a home directory, which the Codex
 stage's read-deny profile hides), makes it read-only, and writes RUN/manifest.json
@@ -38,16 +55,31 @@ writes the text files as prompt-sized bundles (the Codex and Grok stages read
 these). `seal` accepts RUN/verdict.json only for the staged digest, with every
 stage's artefact present or the stage waived in the owner's words, and only when
 the scan matched the values file and that file has not changed since. `verify`
-stages the sources again into a temporary directory and compares digests; `push`
-does the same and then pushes, for each --git source, the exact commit that was
-checked (never HEAD, never --force).
+stages the sources again into a temporary directory and compares digests.
+
+`approve` records the owner's words in RUN/approvals/STEP.json, bound to the step,
+the repository's id on GitHub, the digest, the seal, the pushes, an expiry and (for
+publish) the preflight's match hash and the release; each record covers one action (a
+publish record: one switch and the one release it names), and `revoke` closes it.
+`push` needs a valid push approval, verifies again and pushes, for each --git source,
+the exact commit that was checked (never HEAD, never --force). `preflight` needs
+approval 1 used for the repository, then reads every ref, issue, pull request,
+release, tag, label, Pages site, wiki repository, Actions record and setting of a new
+private repository and writes RUN/preflight.json. `publish` needs a valid publish
+approval and the same preflight result, switches the repository to public, reads the
+inventory again and switches back to private if anything arrived in between, creates
+the approved release from the run's staged copies (--target the checked commit, never
+--generate-notes), and reads both back without credentials; RUN/state.json records each
+step before and after it, so a run that stopped half-way resumes from what GitHub
+actually shows. One push or publish runs at a time per run (RUN/approvals/.lock).
 
 A secret value never reaches this script's output in full: secret-kind hits print
 as a kind and a short redacted preview, and a private value prints as its key.
 
-Exit: 0 ok, clean, sealed, same or pushed; 1 scan hits, gate closed, seal refused,
-digest differs or a push failed; 2 usage, or a tree changed after staging; 3 git or
-gitleaks missing.
+Exit: 0 ok, clean, sealed, same, approved, pushed, ready or published; 1 scan hits,
+gate closed, seal refused, digest differs, an approval missing or refused, a preflight
+refused, or a push, switch or release failed; 2 usage, or a tree changed after
+staging; 3 git, gitleaks or gh missing.
 """
 
 from __future__ import annotations
@@ -67,11 +99,14 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
+import urllib.error
+import urllib.request
 import zipfile
 import zlib
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -95,7 +130,24 @@ STAGES = ("mechanical", "claude", "codex", "grok", "final")
 #: The model family the Claude stages (2 and 5) must report in `ran_on` (SKILL.md's table
 #: pins Opus). Change it here, in one place, if the skill's table pins another model.
 CLAUDE_STAGE_MODEL = "opus"
-GITLEAKS = os.environ.get("AGRODESIGN_GITHUB_UPLOAD_GITLEAKS_BIN") or shutil.which("gitleaks") or ""
+GITLEAKS = os.environ.get("AGRODESIGN_GITHUB_PUBLISH_GITLEAKS_BIN") or shutil.which("gitleaks") or ""
+#: The GitHub CLI, logged in with access to the destination (approve, preflight, publish).
+GH = os.environ.get("AGRODESIGN_GITHUB_PUBLISH_GH_BIN") or shutil.which("gh") or ""
+#: The REST API the anonymous check reads after a switch (no credentials are sent).
+API_URL = os.environ.get("AGRODESIGN_GITHUB_PUBLISH_API_URL", "https://api.github.com").rstrip("/")
+REPO_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}")
+TAG_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+/-]{0,99}")
+FULL_SHA = re.compile(r"[0-9a-f]{40}")
+ASSET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}")
+#: Seconds between the reads right after a switch (GitHub can lag a moment); tests shorten it.
+RETRY_SECONDS = float(os.environ.get("AGRODESIGN_GITHUB_PUBLISH_RETRY_SECONDS", "3"))
+#: Labels every new GitHub repository starts with; any other label is text nobody checked.
+DEFAULT_LABELS = frozenset({"bug", "documentation", "duplicate", "enhancement", "good first issue", "help wanted", "invalid", "question", "wontfix"})
+PAGE_SIZE = 100
+MAX_PAGES = 100
+#: How long an approval stays usable unless the owner gives another window (minutes).
+APPROVAL_STEPS = ("push", "publish", "release")
+VALID_MINUTES = {"push": 24 * 60, "publish": 60, "release": 60}
 ENCODINGS = ("utf-8", "cp932", "euc_jp")
 
 #: Secret-shaped text: always a hit, printed redacted.
@@ -407,10 +459,15 @@ def git(repo: Path, *args: str, binary: bool = False, stdin: bytes | None = None
 
 @dataclass
 class Source:
-    kind: str  # tree | git | file
+    kind: str  # tree | git | file | meta
     path: Path
     remote: str = ""
     ref: str = ""
+    whole: bool = False  # --whole-history: every commit from the root, whatever the destination holds
+    repo: str = ""  # --repo-meta OWNER/NAME
+
+
+SOURCE_USAGE = "--tree DIR, --git REPO --push REMOTE REF [--whole-history], --file PATH or --repo-meta OWNER/NAME"
 
 
 def parse_sources(argv: list[str]) -> list[Source]:
@@ -426,14 +483,23 @@ def parse_sources(argv: list[str]) -> list[Source]:
             remote, ref = argv[i + 3], argv[i + 4]
             if remote.startswith("-") or not re.fullmatch(r"[\w./@^~:-]+", ref) or ref.startswith("-"):
                 die(f"--push needs REMOTE REF, got {remote!r} {ref!r}")
-            out.append(Source("git", Path(argv[i + 1]).resolve(), remote, ref))
-            i += 5
+            whole = i + 5 < len(argv) and argv[i + 5] == "--whole-history"
+            out.append(Source("git", Path(argv[i + 1]).resolve(), remote, ref, whole=whole))
+            i += 6 if whole else 5
+        elif flag == "--repo-meta" and i + 1 < len(argv):
+            name = argv[i + 1]
+            if not REPO_NAME.fullmatch(name):
+                die(f"--repo-meta needs OWNER/NAME, got {name!r}")
+            out.append(Source("meta", Path("."), repo=name))
+            i += 2
         else:
-            die(f"unknown or incomplete source argument at {flag!r} (use --tree DIR, --git REPO --push REMOTE REF or --file PATH)")
+            die(f"unknown or incomplete source argument at {flag!r} (use {SOURCE_USAGE})")
     if not out:
-        die("give at least one source: --tree DIR, --git REPO --push REMOTE REF or --file PATH")
+        die(f"give at least one source: {SOURCE_USAGE}")
     if sum(1 for s in out if s.kind == "git") > 1:  # two pushes, one failing, would publish half
         die("one --git destination per run: stage, check and push each repository on its own")
+    if sum(1 for s in out if s.kind == "meta") > 1:
+        die("one --repo-meta per run: the one repository this run publishes")
     return out
 
 
@@ -580,21 +646,44 @@ class Stager:
         shutil.copyfile(src, dest)
         self.add(dest, f"file:{src.name}")
 
-    def stage_git(self, n: int, src: Source) -> None:
+    def stage_meta(self, n: int, name: str) -> None:
+        """The repository's description, homepage and topics: public once the repository
+        is, so they are staged and read like every file (a re-stage fetches them again)."""
+        try:
+            body = public_meta(gh_repo(name))
+        except GhError as exc:
+            die(f"--repo-meta {name}: {exc}")
+        dest = self.tree / f"{n:02d}-repo" / "repository.json"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(json.dumps(body, ensure_ascii=False, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+        self.add(dest, f"repo:meta:{name}")
+
+    def stage_git(self, n: int, src: Source, recorded: list[dict[str, object]] | None = None) -> None:
         repo = src.path
         ref = full_ref(repo, src.ref)
         url = push_url(repo, src.remote)
         tip = str(git(repo, "rev-parse", "--verify", f"{src.ref}^{{object}}")).strip()
         commit = str(git(repo, "rev-parse", "--verify", f"{src.ref}^{{commit}}")).strip()
         refuse_odd_history(repo, commit)
-        have = remote_shas(repo, url)
+        # What the destination already held when the set was first staged ("base") is
+        # recorded, and a re-stage (verify, push) uses that record, not the live remote:
+        # otherwise a verify after the push would stage nothing and never match. --whole-history
+        # ignores the destination altogether, so the run reads every commit from the root.
+        row = next((r for r in recorded or [] if r.get("url") == url and r.get("ref") == ref), None)
+        if src.whole:
+            have: list[str] = []
+        elif row is not None:
+            have = [str(s) for s in row.get("base", [])]  # type: ignore[union-attr]
+        else:
+            have = remote_shas(repo, url)
         base = self.tree / f"{n:02d}-git"
-        self.pushes.append({"repo": str(repo), "url": url, "ref": ref, "tip": tip})
+        self.pushes.append({"repo": str(repo), "url": url, "ref": ref, "tip": tip, "commit": commit, "base": have, "whole_history": src.whole})  # type: ignore[dict-item]
         # The ref's name and the destination become public too: a staged text file, so the
         # scan and every reviewer read them (the URL with any user part masked).
         meta = base / "PUSH.txt"
         meta.parent.mkdir(parents=True, exist_ok=True)
-        meta.write_text(f"destination {safe(url)}\nref {ref}\ntip {tip}\n", encoding="utf-8")
+        history = "history whole (every commit from the root)\n" if src.whole else "".join(f"after {s}\n" for s in have)
+        meta.write_text(f"destination {safe(url)}\nref {ref}\ntip {tip}\n{history}", encoding="utf-8")
         self.add(meta, f"git:push:{ref}")
         if tip in have:
             return  # the destination already has it: nothing is sent
@@ -658,15 +747,18 @@ class Stager:
         return {"entries": self.entries, "identities": sorted(self.identities), "pushes": self.pushes}
 
 
-def stage_into(sources: list[Source], tree: Path) -> dict[str, object]:
+def stage_into(sources: list[Source], tree: Path, recorded: list[dict[str, object]] | None = None) -> dict[str, object]:
+    """Stage every source; ``recorded`` (the sealed manifest's push rows) fixes each push's base."""
     st = Stager(tree)
     for n, src in enumerate(sources, 1):
         if src.kind == "tree":
             st.stage_tree(n, src.path)
         elif src.kind == "file":
             st.stage_file(n, src.path)
+        elif src.kind == "meta":
+            st.stage_meta(n, src.repo)
         else:
-            st.stage_git(n, src)
+            st.stage_git(n, src, recorded)
     return st.manifest()
 
 
@@ -975,7 +1067,7 @@ def cmd_stage(out: Path, sources: list[Source]) -> int:
     tree = out / "tree"
     tree.mkdir(parents=True)
     manifest = stage_into(sources, tree)
-    manifest["sources"] = [{"kind": s.kind, "path": str(s.path), "remote": s.remote, "ref": s.ref} for s in sources]
+    manifest["sources"] = [{"kind": s.kind, "path": str(s.path), "remote": s.remote, "ref": s.ref, "whole": s.whole, "repo": s.repo} for s in sources]
     manifest["staged_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
     manifest["digest"] = digest_of(manifest)
     (out / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -992,7 +1084,7 @@ def cmd_stage(out: Path, sources: list[Source]) -> int:
         if e["text"] and not e["ai"]:
             print(f"MECHANICAL_ONLY {safe(str(e['path']))} ({e['size']:,} bytes: larger than {AI_MAX_BYTES:,})")
     for push in manifest["pushes"]:  # type: ignore[union-attr]
-        print(f"PUSH {safe(push['url'])} {push['ref']} at {push['tip']}")
+        print(f"PUSH {safe(push['url'])} {push['ref']} at {push['tip']}" + (" (whole history)" if push.get("whole_history") else ""))
     for ident in manifest["identities"]:  # type: ignore[union-attr]
         print(f"IDENTITY {safe(str(ident))} (public after the push)")
     print(f"DIGEST {manifest['digest']}")
@@ -1018,7 +1110,7 @@ def _cut(text: str) -> str:
 #: The values file's one accepted place is default_values_path(): the seal takes a scan
 #: of that file only, never of a --values-file trial (a file of one value would
 #: otherwise do).
-VALUES_DIR_NAME = "agrodesign-github-upload"
+VALUES_DIR_NAME = "agrodesign-github-publish"
 VALUES_FILE_NAME = "values.json"
 VALUES_FORMAT = 1
 VALUES_MAX_BYTES = 1 << 20
@@ -1038,7 +1130,7 @@ class ValuesError(Exception):
 
 
 def default_values_path() -> Path:
-    """$XDG_CONFIG_HOME/agrodesign-github-upload/values.json, else ~/.config/agrodesign-github-upload/values.json."""
+    """$XDG_CONFIG_HOME/agrodesign-github-publish/values.json, else ~/.config/agrodesign-github-publish/values.json."""
     raw = os.environ.get("XDG_CONFIG_HOME", "")
     base = raw if os.path.isabs(raw) else str(Path.home() / ".config")  # a relative value is ignored (XDG)
     return Path(base) / VALUES_DIR_NAME / VALUES_FILE_NAME
@@ -1416,25 +1508,25 @@ def _scan(run: Path, values_file: Path | None) -> int:
             raw_ascii = "\n".join(m.group(0).decode("ascii") for m in PRINTABLE_RUN.finditer((tree / rel).read_bytes()))
             sc.text(rel, raw_ascii, "raw-ascii:", 1)
     if not GITLEAKS or not os.access(GITLEAKS, os.X_OK):
-        print("GITLEAKS=missing — install gitleaks (or set AGRODESIGN_GITHUB_UPLOAD_GITLEAKS_BIN); no scan result is valid without it", file=sys.stderr)
+        print("GITLEAKS=missing — install gitleaks (or set AGRODESIGN_GITHUB_PUBLISH_GITLEAKS_BIN); no scan result is valid without it", file=sys.stderr)
         return 3
     report = scan_dir / "gitleaks.json"
     # gitleaks' own rules, whatever the staged tree or the environment says: an explicit
     # config that only extends the defaults, an empty ignore file, a clean cwd and env
     # (a .gitleaks.toml or .gitleaksignore in the set, or GITLEAKS_CONFIG, would weaken it).
-    with tempfile.TemporaryDirectory(prefix="agrodesign-github-upload-gitleaks-") as gl_tmp:
+    with tempfile.TemporaryDirectory(prefix="agrodesign-github-publish-gitleaks-") as gl_tmp:
         conf, ignore = Path(gl_tmp) / "gitleaks.toml", Path(gl_tmp) / "ignore"
         conf.write_text("[extend]\nuseDefault = true\n")
         ignore.mkdir()
         (ignore / ".gitleaksignore").write_text("")
         env = {k: v for k, v in os.environ.items() if not k.startswith("GITLEAKS")}
         proc = subprocess.run(
-            [GITLEAKS, "dir", str(tree), "--no-banner", "--redact", "--exit-code", "0", "--max-archive-depth", "4",  # the account's own gitleaks (PATH or AGRODESIGN_GITHUB_UPLOAD_GITLEAKS_BIN), argv a list, no shell
+            [GITLEAKS, "dir", str(tree), "--no-banner", "--redact", "--exit-code", "0", "--max-archive-depth", "4",  # the account's own gitleaks (PATH or AGRODESIGN_GITHUB_PUBLISH_GITLEAKS_BIN), argv a list, no shell
              "--ignore-gitleaks-allow", "--config", str(conf), "--gitleaks-ignore-path", str(ignore),
              "--report-format", "json", "--report-path", str(report)],
             capture_output=True, check=False, cwd=gl_tmp, env=env,
         )  # fmt: skip
-        version = subprocess.run([GITLEAKS, "version"], capture_output=True, text=True, check=False, env=env).stdout.strip()  # the account's own gitleaks (PATH or AGRODESIGN_GITHUB_UPLOAD_GITLEAKS_BIN), argv a list, no shell
+        version = subprocess.run([GITLEAKS, "version"], capture_output=True, text=True, check=False, env=env).stdout.strip()  # the account's own gitleaks (PATH or AGRODESIGN_GITHUB_PUBLISH_GITLEAKS_BIN), argv a list, no shell
     try:
         raw = json.loads(report.read_text(encoding="utf-8")) if report.exists() else None
     except ValueError:
@@ -1610,21 +1702,29 @@ def seal_problems(run: Path) -> list[str]:
     return problems
 
 
-def _same(run: Path, sources: list[Source]) -> tuple[bool, dict[str, object] | None]:
+def sealed_state(run: Path) -> tuple[str | None, str]:
+    """(digest, "") while the run's seal holds; (None, why) when it does not."""
     sealed = run / "SEALED"
     if not sealed.exists():
-        print("VERIFY=unsealed: this run has no seal — finish the checks first")
-        return False, None
+        return None, "this run has no seal — finish the checks first"
     sealed_digest, sealed_answers = (sealed.read_text().split() + ["", ""])[:2]
     problems = seal_problems(run)  # also proves the staged copies (release title, notes, assets) unchanged
     if problems or answers_hash(run) != sealed_answers:
-        print("VERIFY=withdrawn: the seal no longer holds (" + (problems[0] if problems else "a scan, answer, clearance or verdict changed after the seal") + ")")
+        return None, problems[0] if problems else "a scan, answer, clearance or verdict changed after the seal"
+    return sealed_digest, ""
+
+
+def _same(run: Path, sources: list[Source]) -> tuple[bool, dict[str, object] | None]:
+    digest, why = sealed_state(run)
+    if digest is None:
+        print(f"VERIFY=unsealed: {why}" if not (run / "SEALED").exists() else f"VERIFY=withdrawn: the seal no longer holds ({why})")
         return False, None
-    with tempfile.TemporaryDirectory(prefix="agrodesign-github-upload-verify-") as tmp:
-        manifest = stage_into(sources, Path(tmp))
+    recorded = load_manifest(run).get("pushes")
+    with tempfile.TemporaryDirectory(prefix="agrodesign-github-publish-verify-") as tmp:
+        manifest = stage_into(sources, Path(tmp), recorded if isinstance(recorded, list) else None)
     now = digest_of(manifest)
-    if now != sealed_digest:
-        print(f"VERIFY=different: sealed {sealed_digest}, now {now} — stage and check again")
+    if now != digest:
+        print(f"VERIFY=different: sealed {digest}, now {now} — stage and check again")
         return False, None
     print(f"VERIFY=same {now}")
     return True, manifest
@@ -1634,10 +1734,367 @@ def cmd_verify(run: Path, sources: list[Source]) -> int:
     return 0 if _same(run, sources)[0] else 1
 
 
+# ── GitHub: the destination, read and changed through the gh CLI ───────────────
+
+
+class GhError(Exception):
+    """A GitHub read or change that did not succeed (never taken as "empty")."""
+
+
+def gh(*args: str) -> subprocess.CompletedProcess[str]:
+    if not GH:
+        die("gh (GitHub CLI) missing: install it and log in with access to the destination", 3)
+    env = {**os.environ, "GH_PROMPT_DISABLED": "1", "GH_PAGER": "cat", "NO_COLOR": "1"}
+    return subprocess.run([GH, *args], capture_output=True, text=True, check=False, env=env)
+
+
+def gh_api(path: str, *, missing_ok: bool = False) -> object:
+    """One REST read. HTTP 404 is None only where the caller asks (a Pages site, a tag);
+    every other failure raises, so an unreadable list is never mistaken for an empty one."""
+    proc = gh("api", "-H", "Accept: application/vnd.github+json", path)
+    if proc.returncode != 0:
+        err = (proc.stderr.strip() or proc.stdout.strip())
+        if missing_ok and "(HTTP 404)" in err:
+            return None
+        raise GhError(f"gh api {path}: {safe(err[-300:])}")
+    try:
+        return json.loads(proc.stdout or "null")
+    except ValueError as exc:
+        raise GhError(f"gh api {path}: not JSON") from exc
+
+
+def gh_list(path: str) -> list[object]:
+    """Every page of a list endpoint (per_page=100), or GhError."""
+    sep = "&" if "?" in path else "?"
+    items: list[object] = []
+    for page in range(1, MAX_PAGES + 1):
+        got = gh_api(f"{path}{sep}per_page={PAGE_SIZE}&page={page}")
+        if not isinstance(got, list):
+            raise GhError(f"gh api {path}: not a list")
+        items.extend(got)
+        if len(got) < PAGE_SIZE:
+            return items
+    raise GhError(f"gh api {path}: more than {MAX_PAGES} pages")
+
+
+def gh_total(path: str) -> int:
+    got = gh_api(path)
+    if not isinstance(got, dict) or not isinstance(got.get("total_count"), int):
+        raise GhError(f"gh api {path}: no total_count")
+    return int(got["total_count"])
+
+
+def gh_repo(name: str) -> dict[str, Any]:
+    got = gh_api(f"repos/{name}")
+    if not isinstance(got, dict) or not isinstance(got.get("id"), int):
+        raise GhError(f"gh api repos/{name}: not a repository")
+    return got
+
+
+def public_meta(meta: dict[str, Any]) -> dict[str, object]:
+    """What a visitor reads about the repository beside its files."""
+    return {"full_name": meta.get("full_name"), "description": meta.get("description"), "homepage": meta.get("homepage"), "topics": sorted(meta.get("topics") or [])}
+
+
+def norm_url(url: str) -> str:
+    """One spelling for a repository URL: https, no user, no trailing .git or slash, lower case."""
+    u = url.strip()
+    m = re.match(r"^(?:ssh://)?git@([^:/]+)[:/](.+)$", u)
+    if m:
+        u = f"https://{m.group(1)}/{m.group(2)}"
+    u = re.sub(r"^git://", "https://", u).rstrip("/")
+    return (u[:-4] if u.endswith(".git") else u).lower()
+
+
+def repo_urls(meta: dict[str, Any]) -> set[str]:
+    return {norm_url(str(meta[k])) for k in ("clone_url", "ssh_url", "git_url", "html_url") if meta.get(k)}
+
+
+def _now() -> datetime:
+    return datetime.now().astimezone()
+
+
+def _write_json(path: Path, data: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+# ── approvals: the owner's words, bound to what they approved, used once ────────
+
+
+def approval_file(run: Path, step: str) -> Path:
+    return run / "approvals" / f"{step}.json"
+
+
+def push_rows(manifest: dict[str, object]) -> list[dict[str, str]]:
+    return [{"url": str(p["url"]), "ref": str(p["ref"]), "tip": str(p["tip"])} for p in manifest.get("pushes") or []]  # type: ignore[union-attr]
+
+
+def approval_expired(rec: dict[str, Any]) -> str | None:
+    try:
+        expires = datetime.fromisoformat(str(rec.get("expires_at")))
+    except ValueError:
+        return "has no valid expiry"
+    return f"expired at {rec.get('expires_at')}" if _now() >= expires else None
+
+
+def approval_closed(rec: dict[str, Any]) -> str | None:
+    """Why an approval can no longer be used (None while it can)."""
+    if isinstance(rec.get("revoked"), dict):
+        return f"revoked at {rec['revoked'].get('at')}"
+    if isinstance(rec.get("used"), dict):
+        return f"used at {rec['used'].get('at')} ({rec['used'].get('result')})"
+    return approval_expired(rec)
+
+
+def approval_problems(run: Path, step: str, digest: str, meta: dict[str, Any], *, used_ok: str | None = None) -> list[str]:
+    """Why the recorded approval for ``step`` does not cover this action (empty: it does)."""
+    rec = _json_file(approval_file(run, step))
+    if not isinstance(rec, dict):
+        return [f"no {step} approval: record the owner's words first (approve --step {step})"]
+    problems: list[str] = []
+    if rec.get("format") != 1 or rec.get("step") != step or not str(rec.get("owner_words") or "").strip():
+        problems.append(f"approvals/{step}.json is malformed or holds no owner's words")
+    if rec.get("digest") != digest:
+        problems.append(f"the approval is for digest {rec.get('digest')}, the run is {digest}")
+    if rec.get("seal") != sha256_file(run / "SEALED"):
+        problems.append("the seal changed since the approval")
+    repo = rec.get("repo") if isinstance(rec.get("repo"), dict) else {}
+    assert isinstance(repo, dict)
+    if repo.get("id") != meta.get("id") or str(repo.get("full_name", "")).lower() != str(meta.get("full_name", "")).lower():
+        problems.append(f"the approval is for {repo.get('full_name')} (id {repo.get('id')}), the destination is {meta.get('full_name')} (id {meta.get('id')})")
+    if rec.get("pushes") != push_rows(load_manifest(run)):
+        problems.append("the approval names other pushes than the run")
+    revoked = rec.get("revoked") if isinstance(rec.get("revoked"), dict) else None
+    used = rec.get("used") if isinstance(rec.get("used"), dict) else None
+    expired = approval_expired(rec)
+    if revoked:
+        problems.append(f"the {step} approval was revoked at {revoked.get('at')}")
+    if expired:
+        problems.append(f"the {step} approval {expired}")
+    if used and not (used_ok and used.get("result") == used_ok):  # a publish approval covers its one release after the switch
+        problems.append(f"the {step} approval was used at {used.get('at')} ({used.get('result')})")
+    return problems
+
+
+def mark_used(run: Path, step: str, result: str) -> None:
+    path = approval_file(run, step)
+    rec = _json_file(path)
+    if isinstance(rec, dict):
+        rec["used"] = {"at": _now().isoformat(timespec="seconds"), "result": result}
+        _write_json(path, rec)
+
+
+def staged_file(manifest: dict[str, object], path: Path, what: str) -> tuple[str, str]:
+    """(sha256, staged path) of a release file: one of this run's --file entries, with the
+    same bytes and the same name (the name is what a release asset is published as)."""
+    if not path.is_file():
+        die(f"{what} {path}: not a file")
+    digest = sha256_file(path)
+    for e in manifest["entries"]:  # type: ignore[union-attr]
+        if e.get("origin") == f"file:{path.name}" and e.get("sha256") == digest:
+            return digest, str(e["path"])
+    die(f"{what} {path}: not a staged --file of this run under that name (stage the release title, notes and assets with the push)")
+    raise AssertionError
+
+
+def release_spec(manifest: dict[str, object], tag: str, target: str, title: Path, notes: Path, assets: list[Path]) -> dict[str, object]:
+    if not TAG_NAME.fullmatch(tag) or ".." in tag or tag.endswith((".", "/", ".lock")):
+        die(f"--release-tag {tag!r}: not a plain tag name")
+    commits = {str(p.get("commit")) for p in manifest.get("pushes") or []}  # type: ignore[union-attr]
+    if not FULL_SHA.fullmatch(target) or target not in commits:
+        die(f"--release-target {target!r}: give the full commit id this run pushes ({', '.join(sorted(commits)) or 'none'})")
+    text = title.read_text(encoding="utf-8").strip() if title.is_file() else ""
+    if not text or "\n" in text:
+        die(f"--release-title {title}: one non-empty line")
+    names = [a.name for a in assets]
+    odd = [n for n in names if not ASSET_NAME.fullmatch(n)]
+    if odd:  # gh reads "name#label", and GitHub rewrites spaces and some characters in asset names
+        die(f"--release-asset: rename {', '.join(odd)} to letters, digits, '.', '_' and '-' only (GitHub would publish another name)")
+    if len(set(names)) != len(names):
+        die("--release-asset: two assets share a name")
+    title_sha, title_path = staged_file(manifest, title, "--release-title")
+    notes_sha, notes_path = staged_file(manifest, notes, "--release-notes")
+    staged_assets = [(a.name, *staged_file(manifest, a, "--release-asset")) for a in assets]
+    return {"tag": tag, "target": target, "title_sha256": title_sha, "title_path": title_path, "notes_sha256": notes_sha, "notes_path": notes_path,
+            "assets": [{"name": n, "sha256": s, "path": p} for n, s, p in staged_assets]}  # fmt: skip
+
+
+def release_allowed(state: dict[str, Any], meta: dict[str, Any]) -> bool:
+    """A release with its own approval: the repository is public and this run either made it
+    public or pushed its checked commit there (a later version of a public repository)."""
+    def by_run(key: str) -> bool:
+        return isinstance(state.get(key), dict) and state[key].get("repo_id") == meta.get("id")
+
+    return by_run("published") or (meta.get("private") is False and by_run("pushed"))
+
+
+def cmd_approve(run: Path, step: str, name: str, words: str, minutes: int | None, rel: argparse.Namespace) -> int:
+    digest, why = sealed_state(run)
+    if digest is None:
+        print(f"APPROVE=refused: {why}")
+        return 1
+    if not words.strip():
+        die("--words: the owner's words, verbatim")
+    manifest = load_manifest(run)
+    try:
+        meta = gh_repo(name)
+    except GhError as exc:
+        print(f"APPROVE=refused: {exc}")
+        return 1
+    problems = [f"the run pushes to {safe(p['url'])}, which is not {meta.get('full_name')}" for p in push_rows(manifest) if norm_url(p["url"]) not in repo_urls(meta)]
+    if step == "push" and not push_rows(manifest):
+        problems.append("this run pushes nothing (no --git source)")
+    preflight: str | None = None
+    state = load_state(run)
+    if step == "publish":
+        pf = _json_file(run / "preflight.json")
+        pf_repo = pf.get("repo") if isinstance(pf, dict) and isinstance(pf.get("repo"), dict) else {}
+        assert isinstance(pf_repo, dict)
+        if not isinstance(pf, dict) or pf.get("problems") or pf_repo.get("id") != meta.get("id") or pf.get("digest") != digest:
+            problems.append("no clean preflight for this repository and digest: run preflight first (PREFLIGHT=ok)")
+        else:
+            preflight = str(pf.get("match"))
+    if step == "release" and not release_allowed(state, meta):
+        problems.append("a release approval on its own is for a public repository this run pushed to, or one it made public (before a switch, the publish approval covers the release)")
+    release = None
+    if rel.release_tag:
+        release = release_spec(manifest, rel.release_tag, rel.release_target or "", Path(rel.release_title or ""), Path(rel.release_notes or ""), [Path(a) for a in rel.release_asset or []])
+    elif step == "release":
+        problems.append("--release-tag, --release-target, --release-title and --release-notes are needed")
+    if step == "push" and rel.release_tag:
+        problems.append("a push approval never covers a release (the release is part of approval 2)")
+    path = approval_file(run, step)
+    old = _json_file(path)
+    if isinstance(old, dict) and approval_closed(old) is None:
+        problems.append(f"an open {step} approval exists (until {old.get('expires_at')}): revoke it first")
+    if problems:
+        for p in problems:
+            print(f"APPROVE=refused: {p}")
+        return 1
+    if path.exists():  # the earlier record stays, under its own time (never over another kept one)
+        stamp = str(old.get("recorded_at") if isinstance(old, dict) else "old").replace(":", "")
+        for k in range(1, 1000):
+            kept = path.with_name(f"{step}-{stamp}{'' if k == 1 else f'-{k}'}.json")
+            try:
+                os.link(path, kept)
+            except FileExistsError:
+                continue
+            path.unlink()
+            break
+        else:
+            die(f"cannot keep the earlier {step} approval: too many kept records")
+    now = _now()
+    window = minutes if minutes is not None else VALID_MINUTES[step]
+    rec = {"format": 1, "step": step, "repo": {"full_name": meta.get("full_name"), "id": meta.get("id"), "node_id": meta.get("node_id")},
+           "digest": digest, "seal": sha256_file(run / "SEALED"), "pushes": push_rows(manifest), "preflight": preflight, "release": release,
+           "owner_words": words, "recorded_at": now.isoformat(timespec="seconds"),
+           "expires_at": (now + timedelta(minutes=window)).isoformat(timespec="seconds"), "revoked": None, "used": None}  # fmt: skip
+    _write_json(path, rec)
+    print(f"APPROVED {step} {meta.get('full_name')} (id {meta.get('id')}) digest {digest} until {rec['expires_at']}")
+    if release:
+        print(f"APPROVED_RELEASE tag {release['tag']} at {release['target']}")
+    return 0
+
+
+def cmd_revoke(run: Path, step: str, words: str) -> int:
+    path = approval_file(run, step)
+    rec = _json_file(path)
+    if not isinstance(rec, dict):
+        print(f"REVOKE=none: no {step} approval recorded")
+        return 1
+    rec["revoked"] = {"at": _now().isoformat(timespec="seconds"), "words": words}
+    _write_json(path, rec)
+    print(f"REVOKED {step} (recorded {rec.get('recorded_at')})")
+    return 0
+
+
+# ── state: what this run has done on the destination, written around every change ──
+
+
+def load_state(run: Path) -> dict[str, Any]:
+    got = _json_file(run / "state.json")
+    return got if isinstance(got, dict) else {}
+
+
+def save_state(run: Path, **updates: object) -> None:
+    state = load_state(run)
+    state.update(updates)
+    _write_json(run / "state.json", state)
+
+
+def _is_ancestor(repo: Path, older: str, newer: str) -> bool:
+    return subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", older, newer], capture_output=True, env=GIT_ENV).returncode == 0
+
+
+def base_problem(push: dict[str, Any]) -> str | None:
+    """A push negotiates with the live destination: if it no longer reaches what the check
+    subtracted (a ref deleted or moved back), the push would send more than was read."""
+    base = [str(s) for s in push.get("base") or []]
+    if not base:
+        return None
+    repo = Path(str(push["repo"]))
+    live = remote_shas(repo, str(push["url"]))
+    for b in base:
+        if not any(b == h or _is_ancestor(repo, b, h) for h in live):
+            return f"the destination no longer reaches {b[:12]} (a ref was deleted or moved back since the check): stage again"
+    return None
+
+
+class RunLock:
+    """One push or publish at a time per run: two concurrent runs would both pass the
+    approval check before either marks it used (O_EXCL lock file, removed on exit)."""
+
+    def __init__(self, run: Path) -> None:
+        self.path = run / "approvals" / ".lock"
+
+    def __enter__(self) -> RunLock:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            die(f"{self.path} exists: another push or publish of this run is running (remove the file only if none is)", 1)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(f"{os.getpid()} {_now().isoformat(timespec='seconds')}\n")
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.path.unlink(missing_ok=True)
+
+
 def cmd_push(run: Path, sources: list[Source]) -> int:
+    with RunLock(run):
+        return _push(run, sources)
+
+
+def _push(run: Path, sources: list[Source]) -> int:
     ok, manifest = _same(run, sources)
     if not ok or manifest is None:
         return 1
+    digest = str(load_manifest(run).get("digest"))
+    rec = _json_file(approval_file(run, "push"))
+    name = rec.get("repo", {}).get("full_name") if isinstance(rec, dict) and isinstance(rec.get("repo"), dict) else None
+    if not name:
+        print("PUSH=refused: no push approval — report the seal, wait for the owner, then approve --step push with their words")
+        return 1
+    try:
+        meta = gh_repo(str(name))
+    except GhError as exc:
+        print(f"PUSH=refused: {exc}")
+        return 1
+    problems = approval_problems(run, "push", digest, meta)
+    problems += [f"the run pushes to {safe(p['url'])}, which is not {meta.get('full_name')}" for p in push_rows(manifest) if norm_url(p["url"]) not in repo_urls(meta)]
+    problems += [b for b in (base_problem(p) for p in manifest["pushes"]) if b]  # type: ignore[union-attr]
+    problems = problems or approval_problems(run, "push", digest, meta)  # again, last: a revoke during the reads stops it
+    if problems:
+        for p in problems:
+            print(f"PUSH=refused: {p}")
+        return 1
+    # Written before the push: a run that stops after it pushes again (git sends nothing new)
+    # with the still-unused approval, and then records it.
+    save_state(run, pushing={"at": _now().isoformat(timespec="seconds"), "repo_id": meta.get("id"), "pushes": push_rows(manifest)})
     for push in manifest["pushes"]:  # type: ignore[union-attr]
         # Only the checked ref: no tags followed, no submodules pushed, no signing push
         # certificate; the destination is the URL the set was computed against.
@@ -1651,6 +2108,513 @@ def cmd_push(run: Path, sources: list[Source]) -> int:
             print(f"PUSH=failed {safe(push['url'])} {push['ref']}: {safe(proc.stderr.strip()[-300:])}")
             return 1
         print(f"PUSH=ok {safe(push['url'])} {push['ref']} = {push['tip']}")
+    mark_used(run, "push", "pushed")
+    save_state(run, pushed={"at": _now().isoformat(timespec="seconds"), "repo_id": meta.get("id"), "pushes": push_rows(manifest)})
+    return 0
+
+
+# ── preflight: everything a switch to public would expose, read and compared ────
+
+
+def preflight_check(run: Path, name: str, *, after_switch: bool = False) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
+    """(inventory, problems, repository) for switching ``name`` to public after this run.
+    ``after_switch`` reads the same inventory once the repository is public (to compare)."""
+    manifest = load_manifest(run)
+    problems: list[str] = []
+    try:
+        meta = gh_repo(name)
+    except GhError as exc:
+        return {}, [str(exc)], {}
+    inv: dict[str, Any] = {"repo": {k: meta.get(k) for k in ("id", "node_id", "full_name", "created_at", "private", "visibility", "fork", "archived", "is_template")}}
+    if not after_switch and meta.get("private") is not True:
+        problems.append(f"{meta.get('full_name')} is not private (visibility {meta.get('visibility')})")
+    if meta.get("fork") or meta.get("archived") or meta.get("is_template"):
+        problems.append("a fork, a template or an archived repository is out of scope")
+    perms = meta.get("permissions")
+    if not (isinstance(perms, dict) and perms.get("admin") is True):
+        problems.append("this account is not an admin of the repository: it cannot switch the visibility (and may not see everything)")
+    pushes = manifest.get("pushes") or []
+    assert isinstance(pushes, list)
+    if not pushes:
+        problems.append("this run pushes nothing: a switch is only for a repository that received this run's checked push")
+    # Approval 1 was given and used for this repository, and this run recorded the push.
+    approved = _json_file(approval_file(run, "push"))
+    state = load_state(run)
+    if not (isinstance(approved, dict) and isinstance(approved.get("repo"), dict) and approved["repo"].get("id") == meta.get("id")
+            and isinstance(approved.get("used"), dict) and approved["used"].get("result") == "pushed"):  # fmt: skip
+        problems.append("approval 1 was not given and used for this repository: approve --step push, then push")
+    if not (isinstance(state.get("pushed"), dict) and state["pushed"].get("repo_id") == meta.get("id") and state["pushed"].get("pushes") == push_rows(manifest)):
+        problems.append("this run has not recorded its push to this repository")
+    for p in pushes:
+        if norm_url(str(p["url"])) not in repo_urls(meta):
+            problems.append(f"the run pushed to {safe(str(p['url']))}, not to {meta.get('full_name')}")
+        if not p.get("whole_history"):
+            problems.append(f"{p['ref']}: staged without --whole-history, so this run did not read the history the destination already held")
+    want = {str(p["ref"]): str(p["tip"]) for p in pushes}
+    # Every ref change GitHub recorded: a force push or a deleted branch leaves commits on
+    # GitHub that anyone can fetch by id once the repository is public, so only plain pushes
+    # and branch creations of commits inside this run's checked history are accepted.
+    try:
+        activity = [a for a in gh_list(f"repos/{name}/activity") if isinstance(a, dict)]
+        inv["activity"] = len(activity)
+        tips = {str(p["ref"]): (Path(str(p["repo"])), str(p.get("commit") or p["tip"])) for p in pushes}
+        for a in activity:
+            kind, ref, after = str(a.get("activity_type")), str(a.get("ref")), str(a.get("after") or "")
+            if kind not in ("push", "branch_creation"):
+                problems.append(f"activity: a {kind} on {ref} — commits it removed stay fetchable by id once public")
+            elif ref not in tips:
+                problems.append(f"activity: a {kind} on {ref}, which is not a checked push of this run")
+            elif not (after == tips[ref][1] or _is_ancestor(tips[ref][0], after, tips[ref][1])):
+                problems.append(f"activity: {ref} once held {after[:12]}, outside this run's checked history")
+    except GhError as exc:
+        problems.append(f"could not read activity: {exc}")
+    lists = {"issues_and_pull_requests": "issues?state=all", "pull_requests": "pulls?state=all", "commit_comments": "comments",
+             "releases": "releases", "milestones": "milestones?state=all", "deployments": "deployments", "forks": "forks"}  # fmt: skip
+    for label, path in lists.items():
+        if after_switch and label == "releases":
+            continue  # the approved release may follow the switch; it is compared on its own
+        try:
+            inv[label] = len(gh_list(f"repos/{name}/{path}"))
+        except GhError as exc:
+            inv[label] = None
+            problems.append(f"could not read {label}: {exc}")
+            continue
+        if inv[label]:
+            problems.append(f"{label}: {inv[label]} — a repository switched by this skill holds none (they were never checked)")
+    try:  # tags other than a checked push of this run
+        tags = [x for x in gh_list(f"repos/{name}/tags") if isinstance(x, dict)]
+        inv["tags"] = sorted(str(x.get("name")) for x in tags if want.get(f"refs/tags/{x.get('name')}") is None)
+        if inv["tags"] and not after_switch:
+            problems.append(f"tags: {', '.join(inv['tags'])[:200]} — not checked pushes of this run")
+    except GhError as exc:
+        problems.append(f"could not read tags: {exc}")
+    for label, path in {"actions_runs": "actions/runs", "actions_artifacts": "actions/artifacts", "environments": "environments"}.items():
+        try:
+            inv[label] = gh_total(f"repos/{name}/{path}")
+        except GhError as exc:
+            inv[label] = None
+            problems.append(f"could not read {label}: {exc}")
+            continue
+        if inv[label]:
+            problems.append(f"{label}: {inv[label]} — Actions history, logs and artefacts become public too")
+    try:
+        labels = sorted(str(x.get("name")) for x in gh_list(f"repos/{name}/labels") if isinstance(x, dict))
+        inv["labels"] = labels
+        extra = [x for x in labels if x not in DEFAULT_LABELS]
+        if extra:
+            problems.append(f"labels beyond GitHub's defaults were never checked: {', '.join(extra)[:200]}")
+    except GhError as exc:
+        problems.append(f"could not read labels: {exc}")
+    try:
+        inv["rulesets"] = sorted(f"{x.get('name')} ({x.get('target')}, {x.get('enforcement')})" for x in gh_list(f"repos/{name}/rulesets") if isinstance(x, dict))
+    except GhError as exc:
+        problems.append(f"could not read rulesets: {exc}")
+    try:
+        inv["pages_site"] = gh_api(f"repos/{name}/pages", missing_ok=True) is not None
+        if inv["pages_site"] or meta.get("has_pages"):
+            problems.append("a GitHub Pages site exists: its content was never checked")
+    except GhError as exc:
+        problems.append(f"could not read the Pages site: {exc}")
+    inv["features"] = {k: meta.get(k) for k in ("has_issues", "has_wiki", "has_discussions", "has_pages", "has_projects")}
+    if meta.get("has_wiki"):
+        problems.append("the wiki is on: its pages are never checked — turn it off first")
+    if meta.get("has_discussions"):
+        problems.append("discussions are on: never checked — turn them off first")
+    if pushes:  # a wiki switched off keeps its pages; switched on again they would show
+        wiki = re.sub(r"(\.git)?/*$", "", str(pushes[0]["url"])) + ".wiki.git"
+        proc = subprocess.run(["git", "ls-remote", wiki], capture_output=True, text=True, check=False, env={**GIT_ENV, "GIT_TERMINAL_PROMPT": "0"})
+        local = "://" not in wiki and not re.match(r"^[\w.-]+@", wiki)
+        if proc.returncode == 0:
+            inv["wiki_refs"] = len([ln for ln in proc.stdout.splitlines() if "\t" in ln])
+        elif re.search(r"Repository not found|repository '[^']*' not found", proc.stderr) or (local and "does not appear to be a git repository" in proc.stderr):
+            inv["wiki_refs"] = 0  # no wiki repository at all
+        else:
+            inv["wiki_refs"] = None
+            problems.append(f"could not read the wiki repository: {safe(proc.stderr.strip()[-200:])}")
+        if inv["wiki_refs"]:
+            problems.append(f"the wiki repository holds {inv['wiki_refs']} ref(s) of pages nobody checked")
+    staged = [e for e in manifest["entries"] if str(e.get("origin", "")).lower() == f"repo:meta:{name}".lower()]  # type: ignore[union-attr]
+    live = public_meta(meta)
+    inv["metadata"] = live
+    if not staged:
+        problems.append("the description, homepage and topics were not part of the checked set: add --repo-meta OWNER/NAME to the run")
+    elif _json_file(run / "tree" / str(staged[0]["path"])) != live:
+        problems.append("the description, homepage or topics changed since the check")
+    if pushes:  # read last: every ref the destination has, GitHub's own included, against the checked pushes
+        proc = subprocess.run(["git", "ls-remote", str(pushes[0]["url"])], capture_output=True, text=True, check=False, env={**GIT_ENV, "GIT_TERMINAL_PROMPT": "0"})
+        if proc.returncode != 0:
+            problems.append(f"git ls-remote failed: {safe(proc.stderr.strip()[-200:])}")
+        else:
+            refs = {ln.split("\t", 1)[1]: ln.split("\t", 1)[0] for ln in proc.stdout.splitlines() if "\t" in ln}
+            head = refs.pop("HEAD", None)
+            for ref, sha in sorted(refs.items()):
+                if ref.endswith("^{}") and ref[:-3] in want:
+                    continue
+                if after_switch and ref.startswith("refs/tags/") and ref[len("refs/tags/"):] == load_state(run).get("releasing", {}).get("tag"):
+                    continue  # the approved release's own tag
+                if want.get(ref) != sha:
+                    problems.append(f"ref {ref} = {sha[:12]} is not a checked push of this run")
+            for ref, tip in want.items():
+                if refs.get(ref) != tip:
+                    problems.append(f"{ref} on the destination is {(refs.get(ref) or 'absent')[:12]}, not the checked {tip[:12]}: push first")
+            if head is not None and head not in want.values():
+                problems.append("the destination's HEAD points outside the checked pushes")
+            inv["refs"] = sorted(([ref, sha] for ref, sha in refs.items()), key=lambda r: r[0])
+    return inv, problems, meta
+
+
+def inventory_match(inv: dict[str, Any], digest: str) -> str:
+    return hashlib.sha256(json.dumps({"digest": digest, "inventory": inv}, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def inventory_core(inv: dict[str, Any]) -> dict[str, Any]:
+    """The inventory without what the switch itself changes (visibility) or may add (the release)."""
+    core = {k: v for k, v in inv.items() if k not in ("releases",)}
+    core["repo"] = {k: v for k, v in (inv.get("repo") or {}).items() if k not in ("private", "visibility")}
+    core["features"] = {k: v for k, v in (inv.get("features") or {}).items()}
+    return core
+
+
+def cmd_preflight(run: Path, name: str) -> int:
+    digest, why = sealed_state(run)
+    if digest is None:
+        print(f"PREFLIGHT=refused: {why}")
+        return 1
+    inv, problems, _ = preflight_check(run, name)
+    match = inventory_match(inv, digest)
+    _write_json(run / "preflight.json", {"format": 1, "digest": digest, "repo": inv.get("repo", {}), "checked_at": _now().isoformat(timespec="seconds"),
+                                         "inventory": inv, "match": match, "problems": problems})  # fmt: skip
+    for key in ("refs", "metadata", "issues_and_pull_requests", "commit_comments", "releases", "tags", "milestones", "deployments", "forks",
+                "actions_runs", "actions_artifacts", "environments", "labels", "rulesets", "pages_site", "features", "wiki_refs", "activity"):  # fmt: skip
+        if key in inv:
+            print(f"INVENTORY {key} {safe(json.dumps(inv[key], ensure_ascii=False))[:300]}")
+    for p in problems:
+        print(f"PREFLIGHT=refused: {p}")
+    if not problems:
+        print(f"PREFLIGHT=ok {match} {inv['repo'].get('full_name')} (id {inv['repo'].get('id')}, created {inv['repo'].get('created_at')})")
+    return 1 if problems else 0
+
+
+# ── publish: the switch to public, then the approved release, then a look without login ──
+
+
+def staged_copy(run: Path, rel_path: object, sha: object) -> Path:
+    """The run's own read-only copy of a release file, recorded in the approval (what is
+    uploaded), checked against the approved hash."""
+    path = run / "tree" / str(rel_path)
+    if not path.is_file() or sha256_file(path) != sha:
+        die(f"the staged copy {rel_path} is missing or not the approved bytes")
+    return path
+
+
+def release_files_problem(spec: dict[str, Any], title: Path | None, notes: Path | None, assets: list[Path]) -> str | None:
+    """The files given on the command line, if any, must be the approved ones (the upload
+    always uses the run's staged copies)."""
+    if title is not None and (not title.is_file() or sha256_file(title) != spec.get("title_sha256")):
+        return f"{title}: not the approved release title"
+    if notes is not None and (not notes.is_file() or sha256_file(notes) != spec.get("notes_sha256")):
+        return f"{notes}: not the approved release notes"
+    if assets and sorted((a.name, sha256_file(a)) for a in assets if a.is_file()) != sorted((str(x["name"]), str(x["sha256"])) for x in spec.get("assets") or []):
+        return "the assets are not the approved ones"
+    return None
+
+
+def tag_target(name: str, tag: str) -> str | None:
+    """The commit an existing tag points at (None: no such tag)."""
+    ref = gh_api(f"repos/{name}/git/ref/tags/{tag}", missing_ok=True)
+    if ref is None:
+        return None
+    obj = ref.get("object") if isinstance(ref, dict) else None
+    if not isinstance(obj, dict):
+        raise GhError(f"tag {tag}: unreadable ref")
+    while obj.get("type") == "tag":
+        tag_obj = gh_api(f"repos/{name}/git/tags/{obj.get('sha')}")
+        obj = tag_obj.get("object") if isinstance(tag_obj, dict) else None
+        if not isinstance(obj, dict):
+            raise GhError(f"tag {tag}: unreadable tag object")
+    return str(obj.get("sha"))
+
+
+def anonymous_get(path: str) -> tuple[int, object]:
+    """A GET with no credentials at all: what any visitor sees."""
+    req = urllib.request.Request(f"{API_URL}/{path}", headers={"Accept": "application/vnd.github+json", "User-Agent": "agrodesign-github-publish"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 - fixed https API (or a test URL)
+            return int(resp.status), json.loads(resp.read().decode("utf-8") or "null")
+    except urllib.error.HTTPError as exc:
+        return int(exc.code), None
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return 0, str(exc)
+
+
+def _norm_text(text: str) -> str:
+    return text.replace("\r\n", "\n").strip()
+
+
+def release_mismatch(found: dict[str, Any], tag: str, title: str, notes: str, assets: list[Path]) -> str | None:
+    """Why a release GitHub shows is not exactly the approved one (None: it is)."""
+    if found.get("tag_name") != tag or found.get("draft") or found.get("prerelease"):
+        return f"tag {found.get('tag_name')}, draft {found.get('draft')}, pre-release {found.get('prerelease')}"
+    if _norm_text(str(found.get("name") or "")) != _norm_text(title):
+        return "its title is not the approved one"
+    if _norm_text(str(found.get("body") or "")) != _norm_text(notes):
+        return "its notes are not the approved ones"
+    got = sorted((str(a.get("name")), int(a.get("size") or 0)) for a in found.get("assets") or [] if isinstance(a, dict))
+    if got != sorted((a.name, a.stat().st_size) for a in assets):
+        return f"its assets {got} are not the approved ones"
+    return None
+
+
+def do_release(run: Path, name: str, spec: dict[str, Any], recheck: Callable[[], list[str]]) -> int:
+    state = load_state(run)
+    tag, target = str(spec["tag"]), str(spec["target"])
+    title_path = staged_copy(run, spec.get("title_path"), spec.get("title_sha256"))
+    notes_path = staged_copy(run, spec.get("notes_path"), spec.get("notes_sha256"))
+    approved_assets = [(str(a["name"]), staged_copy(run, a.get("path"), a.get("sha256"))) for a in spec.get("assets") or []]
+    title, notes = title_path.read_text(encoding="utf-8").strip(), notes_path.read_text(encoding="utf-8")
+    with tempfile.TemporaryDirectory(prefix="agrodesign-github-publish-assets-") as tmp:
+        uploads: list[Path] = []  # each staged copy under its approved name
+        for k, (asset_name, src) in enumerate(approved_assets):
+            d = Path(tmp) / str(k)
+            d.mkdir()
+            shutil.copyfile(src, d / asset_name)
+            uploads.append(d / asset_name)
+        try:
+            meta = gh_repo(name)
+            all_releases = [r for r in gh_list(f"repos/{name}/releases") if isinstance(r, dict)]
+            pointed = tag_target(name, tag)
+        except GhError as exc:
+            print(f"RELEASE=refused: {exc}")
+            return 1
+        if meta.get("private") is not False:
+            print(f"RELEASE=refused: {name} is not public now — a release goes out only on the repository this run made (or found) public")
+            return 1
+        mine = isinstance(state.get("releasing"), dict) and state["releasing"].get("tag") == tag
+        same_tag = [r for r in all_releases if r.get("tag_name") == tag]
+        if any(r.get("draft") for r in same_tag):
+            print(f"RELEASE=refused: a draft release for {tag} exists (an interrupted asset upload?) — delete it on GitHub, then run publish again")
+            return 1
+        if same_tag:
+            bad = release_mismatch(same_tag[0], tag, title, notes, uploads)
+            if mine and not bad and pointed == target:
+                save_state(run, released={"at": _now().isoformat(timespec="seconds"), "tag": tag, "target": target, "url": same_tag[0].get("html_url")})
+                print(f"RELEASE=ok {tag} (found after an interrupted run, identical to the approved one)")
+                return 0
+            print(f"RELEASE=refused: a release for {tag} already exists" + (f" and differs: {bad}" if bad else "") + " — this run did not make it as approved")
+            return 1
+        if pointed is not None and pointed != target:
+            print(f"RELEASE=refused: tag {tag} already exists and points at {pointed[:12]}, not the approved {target[:12]}")
+            return 1
+        last = recheck()  # the approval once more, right before the call: a revoke during the reads stops it
+        if last:
+            return _refuse("RELEASE", last)
+        save_state(run, releasing={"at": _now().isoformat(timespec="seconds"), "tag": tag, "target": target})
+        proc = gh("release", "create", tag, "--repo", name, "--target", target, "--title", title, "--notes-file", str(notes_path), "--latest", *[str(u) for u in uploads])
+        if proc.returncode != 0:
+            print(f"RELEASE=failed: {safe((proc.stderr or proc.stdout).strip()[-300:])} — run publish again to resume (the state is read first)")
+            return 1
+        try:
+            made = gh_api(f"repos/{name}/releases/tags/{tag}")
+            pointed = tag_target(name, tag)
+        except GhError as exc:
+            print(f"RELEASE=unconfirmed: {exc} — run state to see what GitHub holds")
+            return 1
+        bad = release_mismatch(made, tag, title, notes, uploads) if isinstance(made, dict) else "unreadable"
+    if bad or pointed != target or not isinstance(made, dict):
+        print(f"RELEASE=wrong: GitHub shows tag {tag} at {str(pointed)[:12]} ({bad}) — check it by hand")
+        return 1
+    save_state(run, released={"at": _now().isoformat(timespec="seconds"), "tag": tag, "target": target, "url": made.get("html_url")})
+    print(f"RELEASE=ok {tag} at {target} {made.get('html_url')}")
+    return 0
+
+
+def cmd_publish(run: Path, name: str, title: Path | None, notes: Path | None, assets: list[Path]) -> int:
+    with RunLock(run):
+        return _publish(run, name, title, notes, assets)
+
+
+def _refuse(prefix: str, problems: list[str]) -> int:
+    for p in problems:
+        print(f"{prefix}=refused: {p}")
+    return 1
+
+
+def after_switch(run: Path, name: str, digest: str, before: dict[str, Any]) -> tuple[str, list[str]]:
+    """Read the inventory again once the repository is public. ("ok", []) when it equals
+    ``before`` (the approved, pre-switch inventory) apart from the visibility; ("private", [])
+    when GitHub still shows it private after a few reads (the switch is not confirmed);
+    ("unreadable", reasons) when reads kept failing; ("changed", reasons) otherwise."""
+    for attempt in range(4):
+        inv2, post, after = preflight_check(run, name, after_switch=True)
+        unreadable = bool(post) and all(p.startswith(("could not read", "git ls-remote failed", "gh api ")) for p in post)
+        if (after.get("private") is False and not unreadable) or (post and not unreadable):
+            break
+        if attempt < 3:  # GitHub can show the old visibility, or fail a read, for a moment
+            time.sleep(RETRY_SECONDS * (attempt + 1))
+    if post:
+        return ("unreadable" if unreadable else "changed"), post
+    if after.get("private") is not False:
+        return "private", []
+    if inventory_match(inventory_core(inv2), digest) != inventory_match(inventory_core(before), digest):
+        return "changed", ["the inventory changed during the switch"]
+    return "ok", []
+
+
+def revert(run: Path, name: str, repo_id: object, reasons: list[str], kind: str = "changed") -> int:
+    back = gh("repo", "edit", name, "--visibility", "private", "--accept-visibility-change-consequences")
+    save_state(run, reverted={"at": _now().isoformat(timespec="seconds"), "repo_id": repo_id, "ok": back.returncode == 0, "kind": kind, "why": reasons[:5]})
+    mark_used(run, "publish", "reverted")
+    what = "the repository changed around the switch" if kind == "changed" else "GitHub could not be read right after the switch (nothing is known to have changed)"
+    print(f"PUBLISH=reverted: {what}, so it was switched back to private" + ("" if back.returncode == 0 else " — the switch back FAILED: make it private by hand now"))
+    for p in reasons:
+        print(f"PUBLISH=reverted: {p}")
+    return 1
+
+
+def _publish(run: Path, name: str, title: Path | None, notes: Path | None, assets: list[Path]) -> int:
+    digest, why = sealed_state(run)
+    if digest is None:
+        print(f"PUBLISH=refused: {why}")
+        return 1
+    try:
+        meta = gh_repo(name)
+    except GhError as exc:
+        print(f"PUBLISH=refused: {exc}")
+        return 1
+    state = load_state(run)
+    pub = _json_file(approval_file(run, "publish"))
+    reverted = state.get("reverted")
+    if isinstance(reverted, dict):
+        fresh = (reverted.get("kind") == "read failure" and reverted.get("ok") and meta.get("private") is True and isinstance(pub, dict)
+                 and approval_closed(pub) is None and str(pub.get("recorded_at")) > str(reverted.get("at")))  # fmt: skip
+        if not fresh:
+            if reverted.get("kind") == "read failure" and reverted.get("ok"):
+                print("PUBLISH=refused: a read failed right after this run's switch and it was switched back; run preflight, ask the owner again, record a new publish approval, then publish")
+            else:
+                print("PUBLISH=refused: this run found a change around its switch and " + ("switched the repository back to private" if reverted.get("ok") else "could NOT switch it back — make it private by hand now")
+                      + "; stage a new run and ask the owner again")  # fmt: skip
+            return 1
+        save_state(run, reverted_earlier=reverted, reverted=None, publishing=None)  # a fresh approval after a read failure
+        state = load_state(run)
+    rel = _json_file(approval_file(run, "release"))
+    pub_spec = pub.get("release") if isinstance(pub, dict) and isinstance(pub.get("release"), dict) else None
+    switched_here = False
+    if not isinstance(state.get("published"), dict):
+        if meta.get("private") is False:
+            if isinstance(state.get("publishing"), dict) and state["publishing"].get("repo_id") == meta.get("id"):
+                # The switch happened in a run that stopped before recording it: check it now,
+                # against the inventory the owner approved, before calling it published.
+                pf = _json_file(run / "preflight.json")
+                if not (isinstance(pf, dict) and isinstance(pub, dict) and pf.get("match") == pub.get("preflight") and isinstance(pf.get("inventory"), dict)):
+                    return revert(run, name, meta.get("id"), ["the approved preflight is no longer on record"])
+                status, reasons = after_switch(run, name, digest, pf["inventory"])
+                if status in ("changed", "unreadable"):
+                    return revert(run, name, meta.get("id"), reasons, "changed" if status == "changed" else "read failure")
+                if status == "private":
+                    print("PUBLISH=unconfirmed: the repository reads private again — nothing recorded; run state, then publish again")
+                    return 1
+                save_state(run, published={"at": _now().isoformat(timespec="seconds"), "repo_id": meta.get("id"), "note": "found public after an interrupted run, checked"})
+                mark_used(run, "publish", "published")
+                switched_here = True
+                print(f"PUBLISH=ok {meta.get('html_url') or name} (the switch of an interrupted run, checked now)")
+            elif not (release_allowed(state, meta) and isinstance(rel, dict) and approval_closed(rel) is None):
+                print(f"PUBLISH=refused: {name} is already public, and not by this run (a release there needs this run's push and an open approve --step release)")
+                return 1
+            # else: a public repository this run pushed to — no switch, only the approved release
+        else:
+            problems = approval_problems(run, "publish", digest, meta)
+            if pub_spec:
+                bad = release_files_problem(pub_spec, title, notes, assets)
+                if bad:
+                    problems.append(bad)
+            inv, pre, _ = preflight_check(run, name)  # once more, immediately before the switch
+            problems += pre
+            if not pre and isinstance(pub, dict) and inventory_match(inv, digest) != pub.get("preflight"):
+                problems.append("the destination changed since the approved preflight: run preflight and ask the owner again")
+            problems = problems or approval_problems(run, "publish", digest, meta)  # again, last: a revoke during the reads stops it
+            if problems:
+                return _refuse("PUBLISH", problems)
+            save_state(run, publishing={"at": _now().isoformat(timespec="seconds"), "repo_id": meta.get("id")})
+            proc = gh("repo", "edit", name, "--visibility", "public", "--accept-visibility-change-consequences")
+            if proc.returncode != 0:
+                print(f"PUBLISH=failed: {safe((proc.stderr or proc.stdout).strip()[-300:])} — run publish again to resume (the state is read first)")
+                return 1
+            # Read everything again now that it is public: anything that arrived between the
+            # last read and the switch is caught here, and the repository goes back to private.
+            status, reasons = after_switch(run, name, digest, inv)
+            if status in ("changed", "unreadable"):
+                return revert(run, name, meta.get("id"), reasons, "changed" if status == "changed" else "read failure")
+            if status == "private":
+                print("PUBLISH=unconfirmed: GitHub still shows the repository private — run state, then publish again")
+                return 1
+            save_state(run, published={"at": _now().isoformat(timespec="seconds"), "repo_id": meta.get("id")})
+            mark_used(run, "publish", "published")
+            switched_here = True
+            print(f"PUBLISH=ok {meta.get('html_url') or name}")
+    else:
+        switched_here = state["published"].get("repo_id") == meta.get("id")
+    # The release: a release approval, if one was recorded, decides (no falling back to the
+    # publish approval once a release approval exists, open or not); otherwise the release
+    # approval 2 named, and only on the repository this run itself switched.
+    if not isinstance(load_state(run).get("released"), dict):
+        if isinstance(rel, dict):
+            spec, step = (rel.get("release") if isinstance(rel.get("release"), dict) else None), "release"
+        elif switched_here and pub_spec:
+            spec, step = pub_spec, "publish"
+        else:
+            spec, step = None, ""
+        if spec is not None:
+            used_ok = "published" if step == "publish" else None
+            problems = approval_problems(run, step, digest, meta, used_ok=used_ok)
+            bad = release_files_problem(spec, title, notes, assets)
+            if bad:
+                problems.append(bad)
+            if problems:
+                return _refuse("RELEASE", problems)
+            if do_release(run, name, spec, lambda: approval_problems(run, step, digest, meta, used_ok=used_ok)) != 0:
+                return 1
+            mark_used(run, step, "published+released" if step == "publish" else "released")
+    return public_check(run, name)
+
+
+def public_check(run: Path, name: str) -> int:
+    """Read the repository (and the release) the way a visitor does: no credentials."""
+    released = load_state(run).get("released")
+    paths = [f"repos/{name}"] + ([f"repos/{name}/releases/tags/{released['tag']}"] if isinstance(released, dict) else [])
+    for path in paths:
+        for attempt in range(4):
+            status, body = anonymous_get(path)
+            if status == 200:
+                break
+            time.sleep(5 * (attempt + 1))
+        if status != 200:
+            print(f"PUBLIC=not-visible {path}: HTTP {status} — GitHub can take a minute; run state again")
+            return 1
+        if path == f"repos/{name}" and isinstance(body, dict) and body.get("private") is not False:
+            print(f"PUBLIC=not-visible {path}: still private")
+            return 1
+    print(f"PUBLIC=ok {', '.join(paths)} without login")
+    return 0
+
+
+def cmd_state(run: Path, name: str) -> int:
+    state = load_state(run)
+    for key in ("pushing", "pushed", "publishing", "published", "reverted", "releasing", "released"):
+        if key in state:
+            print(f"STATE {key} {json.dumps(state[key], ensure_ascii=False)}")
+    for step in APPROVAL_STEPS:
+        rec = _json_file(approval_file(run, step))
+        if isinstance(rec, dict):
+            print(f"APPROVAL {step} recorded {rec.get('recorded_at')} — {approval_closed(rec) or 'open until ' + str(rec.get('expires_at'))}")
+    try:
+        meta = gh_repo(name)
+        print(f"LIVE {meta.get('full_name')} visibility {meta.get('visibility')}")
+        released = state.get("released") or state.get("releasing")
+        if isinstance(released, dict):
+            print(f"LIVE tag {released.get('tag')} at {tag_target(name, str(released.get('tag')))}")
+    except GhError as exc:
+        print(f"LIVE unreadable: {exc}")
+        return 1
     return 0
 
 
@@ -1694,7 +2658,36 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--before", required=True, choices=("codex", "grok"))
         a = p.parse_args(rest)
         return cmd_gate(a.run, a.before)
-    die(f"unknown command {cmd!r}: stage, scan, bundle, gate, seal, verify or push")
+    if cmd in ("approve", "revoke", "preflight", "publish", "state"):
+        p.add_argument("--run", required=True, type=_abs_path)
+        if cmd in ("approve", "revoke"):
+            p.add_argument("--step", required=True, choices=APPROVAL_STEPS)
+            p.add_argument("--words", required=True, help="the owner's words, verbatim")
+        if cmd != "revoke":
+            p.add_argument("--repo", required=True, help="OWNER/NAME on GitHub")
+        if cmd == "approve":
+            p.add_argument("--valid-minutes", type=int)
+            p.add_argument("--release-tag")
+            p.add_argument("--release-target")
+        if cmd in ("approve", "publish"):
+            p.add_argument("--release-title", type=_abs_path)
+            p.add_argument("--release-notes", type=_abs_path)
+            p.add_argument("--release-asset", type=_abs_path, action="append", default=[])
+        a = p.parse_args(rest)
+        if cmd != "revoke" and not REPO_NAME.fullmatch(a.repo):
+            die(f"--repo needs OWNER/NAME, got {a.repo!r}")
+        if cmd == "approve":
+            if a.valid_minutes is not None and not 1 <= a.valid_minutes <= 7 * 24 * 60:
+                die("--valid-minutes: between 1 and 10080")
+            return cmd_approve(a.run, a.step, a.repo, a.words, a.valid_minutes, a)
+        if cmd == "revoke":
+            return cmd_revoke(a.run, a.step, a.words)
+        if cmd == "preflight":
+            return cmd_preflight(a.run, a.repo)
+        if cmd == "publish":
+            return cmd_publish(a.run, a.repo, a.release_title, a.release_notes, a.release_asset)
+        return cmd_state(a.run, a.repo)
+    die(f"unknown command {cmd!r}: stage, scan, bundle, gate, seal, verify, approve, revoke, push, preflight, publish or state")
     return 2
 
 

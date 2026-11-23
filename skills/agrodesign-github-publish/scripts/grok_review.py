@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """grok_review.py — one Grok security read of an upload bundle, with no local tool
-(the agrodesign-github-upload skill, Step 4).
+(the agrodesign-github-publish skill, Step 4).
 
   python3 -I grok_review.py <bundle.md> <out.json>
   python3 -I grok_review.py --check

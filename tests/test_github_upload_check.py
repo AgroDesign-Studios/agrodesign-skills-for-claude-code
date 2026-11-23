@@ -13,7 +13,7 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from helpers import FAKE_ACCOUNT, FAKE_HOST, FAKE_KEY_LINE, FAKE_TOKEN, UploadCase
+from helpers import FAKE_ACCOUNT, FAKE_HOST, FAKE_KEY_LINE, FAKE_TOKEN, FakeGitHub, UploadCase, fake_repo
 
 
 def git(repo: Path, *args: str) -> str:
@@ -86,7 +86,7 @@ class ScanCases(UploadCase):
 
     def test_relative_run_path_works(self) -> None:
         run = self.staged(self.make_tree({"a.txt": "fine\n"}))
-        got = subprocess.run(["python3", "-I", str(Path(__file__).resolve().parent.parent / "skills/agrodesign-github-upload/scripts/github_upload_check.py"), "scan", "--run", run.name], cwd=self.tmp, env=self.env, capture_output=True, text=True, check=False)
+        got = subprocess.run(["python3", "-I", str(Path(__file__).resolve().parent.parent / "skills/agrodesign-github-publish/scripts/github_upload_check.py"), "scan", "--run", run.name], cwd=self.tmp, env=self.env, capture_output=True, text=True, check=False)
         self.assertEqual(got.returncode, 0, got.stdout + got.stderr)
 
     def test_home_directory_run_is_refused(self) -> None:
@@ -128,12 +128,12 @@ class ValuesFileCases(UploadCase):
 
     def test_config_folder_linked_into_a_work_tree_is_refused(self) -> None:
         dotfiles = self.tmp / "dotfiles"
-        (dotfiles / "agrodesign-github-upload").mkdir(parents=True)
+        (dotfiles / "agrodesign-github-publish").mkdir(parents=True)
         git(dotfiles, "init", "-q")
-        (dotfiles / "agrodesign-github-upload" / "values.json").write_text(self.values_path.read_text())
+        (dotfiles / "agrodesign-github-publish" / "values.json").write_text(self.values_path.read_text())
         self.values_path.unlink()
         self.values_path.parent.rmdir()
-        self.values_path.parent.symlink_to(dotfiles / "agrodesign-github-upload")
+        self.values_path.parent.symlink_to(dotfiles / "agrodesign-github-publish")
         self.assertIn("in-git", self.scan_problem())
 
     def test_relative_xdg_config_home_is_ignored(self) -> None:
@@ -278,7 +278,16 @@ class GitPushCases(UploadCase):
         self.assertIn(f"PUSH {self.dest} refs/heads/main at {tip}", got.stdout)
         self.complete(run)
         self.assertIn("SEAL=ok", self.run_check("seal", "--run", str(run)).stdout)
-        got = self.run_check("push", "--run", str(run), "--git", str(self.clone), "--push", "origin", "main")
+        github = FakeGitHub(self.tmp / "gh")
+        self.addCleanup(github.stop)
+        github.update(lambda st: st["repos"].update({"acme/widgets": fake_repo("acme/widgets", str(self.dest))}))
+        env = {**self.env, "AGRODESIGN_GITHUB_PUBLISH_GH_BIN": str(github.gh)}
+        got = self.run_check("push", "--run", str(run), "--git", str(self.clone), "--push", "origin", "main", env=env)
+        self.assertEqual(got.returncode, 1)
+        self.assertIn("PUSH=refused: no push approval", got.stdout)
+        got = self.run_check("approve", "--run", str(run), "--step", "push", "--repo", "acme/widgets", "--words", "push it", env=env)
+        self.assertEqual(got.returncode, 0, got.stdout + got.stderr)
+        got = self.run_check("push", "--run", str(run), "--git", str(self.clone), "--push", "origin", "main", env=env)
         self.assertEqual(got.returncode, 0, got.stdout + got.stderr)
         self.assertIn("PUSH=ok", got.stdout)
         self.assertEqual(subprocess.run(["git", "--git-dir", str(self.dest), "rev-parse", "main"], capture_output=True, text=True, check=True).stdout.strip(), tip)

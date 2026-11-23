@@ -4,7 +4,7 @@ The generic patterns of the scan (private IP ranges, `.local`/`.internal` host n
 
 ## Where
 
-`$XDG_CONFIG_HOME/agrodesign-github-upload/values.json`, or `~/.config/agrodesign-github-upload/values.json` when `XDG_CONFIG_HOME` is not set. This is the only file a seal accepts.
+`$XDG_CONFIG_HOME/agrodesign-github-publish/values.json`, or `~/.config/agrodesign-github-publish/values.json` when `XDG_CONFIG_HOME` is not set. This is the only file a seal accepts.
 
 - The file must lie outside every git work tree (no `.git` in any folder above it): the scan refuses one inside, because it could be committed and published. The check looks at the path as written and with every link resolved (a config folder linked into a dotfiles repository is refused), and asks git itself. If your home folder is itself a git repository (dotfiles), point `XDG_CONFIG_HOME` at a folder outside it for the runs of this skill. A *bare* dotfiles repository whose work tree is your home only through its own config cannot be seen from the file: never add the values file to it, and list it in that repository's exclude file.
 - It must be a regular file (not a symbolic link) of at most 1 MiB, UTF-8 JSON.
