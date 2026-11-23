@@ -738,6 +738,20 @@ class PublishCases(UploadCase):
         self.assertIn("was replaced while this command ran", got.stdout)
         self.assertEqual(self.visibility(), "private")
 
+    def test_an_approval_replaced_during_the_switch_releases_nothing(self) -> None:
+        run = self.ready_to_publish(*self.release_args())
+        path = run / "approvals" / "publish.json"
+        self.github.update(lambda st: st.update({"edit_replaces_file": str(path)}))
+        got = self.publish(run)
+        self.assertEqual(got.returncode, 1)
+        self.assertIn("PUBLISH=ok", got.stdout)  # the switch went out on the approval checked right before it
+        self.assertIn("RELEASE=refused: the publish approval was replaced while this command ran", got.stdout)
+        self.assertFalse(any(a[:2] == ["release", "create"] for a in self.github.read()["log"]))
+        rec = json.loads(path.read_text())
+        self.assertIsNone(rec.get("used"), "the replacing record approved nothing and stays unused")
+        got = self.publish(run)  # a resume takes the replacing record, which names no release
+        self.assertFalse(any(a[:2] == ["release", "create"] for a in self.github.read()["log"]))
+
     def test_preflight_waits_for_the_activity_log(self) -> None:
         run = self.pushed()
         self.github.update(lambda st: st["lists"].update({"activity": []}))

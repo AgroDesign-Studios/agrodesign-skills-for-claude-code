@@ -125,6 +125,10 @@ if args[:2] == ["repo", "edit"]:
         st["repos"][name]["visibility"] = vis
         if vis == "public" and st.get("edit_adds_issue"):  # something arrives during the switch
             st.setdefault("lists", {}).setdefault("issues", []).append({"number": 99})
+        if vis == "public" and st.get("edit_replaces_file"):  # the approval is replaced (no release) during the switch
+            rec = json.load(open(st["edit_replaces_file"]))
+            rec["recorded_at"], rec["release"] = "2026-01-02T03:04:07+00:00", None
+            json.dump(rec, open(st["edit_replaces_file"], "w"))
         if vis == "public" and st.get("edit_adds_release"):  # a release on an existing tag, during the switch
             st.setdefault("lists", {}).setdefault("releases", []).append({"tag_name": "v0.0.1", "draft": False, "prerelease": False, "name": "x", "body": "x", "assets": []})
         if vis == "public" and st.pop("edit_fail_after_switch", False):  # switched, but the call reports a failure

@@ -1893,7 +1893,7 @@ def approval_problems(run: Path, step: str, digest: str, meta: dict[str, Any], *
     if not isinstance(rec, dict):
         return [f"no {step} approval: record the owner's words first (approve --step {step})"]
     problems: list[str] = []
-    if isinstance(same_as, dict) and any(rec.get(k) != same_as.get(k) for k in ("recorded_at", "digest", "preflight", "release", "pushes")):
+    if isinstance(same_as, dict) and not same_approval(rec, same_as):
         problems.append(f"the {step} approval was replaced while this command ran: run it again")
     if rec.get("format") != 1 or rec.get("step") != step or not str(rec.get("owner_words") or "").strip():
         problems.append(f"approvals/{step}.json is malformed or holds no owner's words")
@@ -1919,12 +1919,25 @@ def approval_problems(run: Path, step: str, digest: str, meta: dict[str, Any], *
     return problems
 
 
-def mark_used(run: Path, step: str, result: str) -> None:
+#: What makes an approval record the one the owner gave (its use and revocation aside).
+APPROVAL_KEYS = ("recorded_at", "digest", "preflight", "release", "pushes")
+
+
+def same_approval(rec: object, other: object) -> bool:
+    return isinstance(rec, dict) and isinstance(other, dict) and all(rec.get(k) == other.get(k) for k in APPROVAL_KEYS)
+
+
+def mark_used(run: Path, step: str, result: str, expect: object) -> bool:
+    """Mark the approval ``expect`` (the record the command started with) used. False, and
+    nothing written, when the file now holds another record: that one was never used."""
     path = approval_file(run, step)
     rec = _json_file(path)
-    if isinstance(rec, dict):
-        rec["used"] = {"at": _now().isoformat(timespec="seconds"), "result": result}
-        _write_json(path, rec)
+    if not same_approval(rec, expect):
+        return False
+    assert isinstance(rec, dict)
+    rec["used"] = {"at": _now().isoformat(timespec="seconds"), "result": result}
+    _write_json(path, rec)
+    return True
 
 
 def staged_file(manifest: dict[str, object], path: Path, what: str) -> tuple[str, str]:
@@ -2148,7 +2161,8 @@ def _push(run: Path, sources: list[Source]) -> int:
             print(f"PUSH=failed {safe(push['url'])} {push['ref']}: {safe(proc.stderr.strip()[-300:])}")
             return 1
         print(f"PUSH=ok {safe(push['url'])} {push['ref']} = {push['tip']}")
-    mark_used(run, "push", "pushed")
+    if not mark_used(run, "push", "pushed", rec):
+        print("PUSH=note: the push approval was replaced after the push went out (on the record checked right before it); the new record is left unused")
     save_state(run, pushed={"at": _now().isoformat(timespec="seconds"), "repo_id": meta.get("id"), "pushes": push_rows(manifest)})
     return 0
 
@@ -2558,10 +2572,11 @@ def after_switch(run: Path, name: str, digest: str, before: dict[str, Any]) -> t
     return "ok", []
 
 
-def revert(run: Path, name: str, repo_id: object, reasons: list[str], kind: str = "changed") -> int:
+def revert(run: Path, name: str, repo_id: object, reasons: list[str], approval: object, kind: str = "changed") -> int:
+    """Switch back to private; ``approval`` (the record the switch went out on) is closed."""
     back = gh("repo", "edit", name, "--visibility", "private", "--accept-visibility-change-consequences")
     save_state(run, reverted={"at": _now().isoformat(timespec="seconds"), "repo_id": repo_id, "ok": back.returncode == 0, "kind": kind, "why": reasons[:5]})
-    mark_used(run, "publish", "reverted")
+    mark_used(run, "publish", "reverted", approval)  # a record put in its place since stays unused, and older than the revert
     what = "the repository changed around the switch" if kind == "changed" else "GitHub could not be read right after the switch (nothing is known to have changed)"
     print(f"PUBLISH=reverted: {what}, so it was switched back to private" + ("" if back.returncode == 0 else " — the switch back FAILED: make it private by hand now"))
     for p in reasons:
@@ -2596,7 +2611,7 @@ def _publish(run: Path, name: str, title: Path | None, notes: Path | None, asset
         state = load_state(run)
     rel = _json_file(approval_file(run, "release"))
     pub_spec = pub.get("release") if isinstance(pub, dict) and isinstance(pub.get("release"), dict) else None
-    switched_here = False
+    switched_here = replaced = False
     if not isinstance(state.get("published"), dict):
         if meta.get("private") is False:
             if isinstance(state.get("publishing"), dict) and state["publishing"].get("repo_id") == meta.get("id"):
@@ -2604,15 +2619,15 @@ def _publish(run: Path, name: str, title: Path | None, notes: Path | None, asset
                 # against the inventory the owner approved, before calling it published.
                 pf = _json_file(run / "preflight.json")
                 if not (isinstance(pf, dict) and isinstance(pub, dict) and pf.get("match") == pub.get("preflight") and isinstance(pf.get("inventory"), dict)):
-                    return revert(run, name, meta.get("id"), ["the approved preflight is no longer on record"])
+                    return revert(run, name, meta.get("id"), ["the approved preflight is no longer on record"], pub)
                 status, reasons = after_switch(run, name, digest, pf["inventory"])
                 if status in ("changed", "unreadable"):
-                    return revert(run, name, meta.get("id"), reasons, "changed" if status == "changed" else "read failure")
+                    return revert(run, name, meta.get("id"), reasons, pub, "changed" if status == "changed" else "read failure")
                 if status == "private":
                     print("PUBLISH=unconfirmed: the repository reads private again — nothing recorded; run state, then publish again")
                     return 1
                 save_state(run, published={"at": _now().isoformat(timespec="seconds"), "repo_id": meta.get("id"), "note": "found public after an interrupted run, checked"})
-                mark_used(run, "publish", "published")
+                replaced = not mark_used(run, "publish", "published", pub)
                 switched_here = True
                 print(f"PUBLISH=ok {meta.get('html_url') or name} (the switch of an interrupted run, checked now)")
             elif not (release_allowed(state, meta) and isinstance(rel, dict) and approval_closed(rel) is None):
@@ -2641,38 +2656,46 @@ def _publish(run: Path, name: str, title: Path | None, notes: Path | None, asset
             # last read and the switch is caught here, and the repository goes back to private.
             status, reasons = after_switch(run, name, digest, inv)
             if status in ("changed", "unreadable"):
-                return revert(run, name, meta.get("id"), reasons, "changed" if status == "changed" else "read failure")
+                return revert(run, name, meta.get("id"), reasons, pub, "changed" if status == "changed" else "read failure")
             if status == "private":
                 print("PUBLISH=unconfirmed: GitHub still shows the repository private — run state, then publish again")
                 return 1
             save_state(run, published={"at": _now().isoformat(timespec="seconds"), "repo_id": meta.get("id")})
-            mark_used(run, "publish", "published")
+            replaced = not mark_used(run, "publish", "published", pub)
             switched_here = True
             print(f"PUBLISH=ok {meta.get('html_url') or name}")
     else:
         switched_here = state["published"].get("repo_id") == meta.get("id")
+    if replaced:
+        # The switch went out on the approval this command started with (checked last, right
+        # before it); a record put in its place since then approved neither that switch nor
+        # a release, so it is left unused and no release follows.
+        print("RELEASE=refused: the publish approval was replaced while this command ran — no release; record a release approval (approve --step release) for one")
+        return 1
     # The release: a release approval, if one was recorded, decides (no falling back to the
     # publish approval once a release approval exists, open or not); otherwise the release
-    # approval 2 named, and only on the repository this run itself switched.
+    # approval 2 named, and only on the repository this run itself switched. Every check, and
+    # the mark of use, is bound to the record read when this command began (``first``): the
+    # release is the one that record names, and a record replaced since stops it.
     if not isinstance(load_state(run).get("released"), dict):
         if isinstance(rel, dict):
-            spec, step = (rel.get("release") if isinstance(rel.get("release"), dict) else None), "release"
+            spec, step, first = (rel.get("release") if isinstance(rel.get("release"), dict) else None), "release", rel
         elif switched_here and pub_spec:
-            spec, step = pub_spec, "publish"
+            spec, step, first = pub_spec, "publish", pub
         else:
-            spec, step = None, ""
+            spec, step, first = None, "", None
         if spec is not None:
             used_ok = "published" if step == "publish" else None
-            problems = approval_problems(run, step, digest, meta, used_ok=used_ok)
+            problems = approval_problems(run, step, digest, meta, used_ok=used_ok, same_as=first)
             bad = release_files_problem(spec, title, notes, assets)
             if bad:
                 problems.append(bad)
             if problems:
                 return _refuse("RELEASE", problems)
-            first = _json_file(approval_file(run, step))
             if do_release(run, name, spec, lambda: approval_problems(run, step, digest, meta, used_ok=used_ok, same_as=first)) != 0:
                 return 1
-            mark_used(run, step, "published+released" if step == "publish" else "released")
+            if not mark_used(run, step, "published+released" if step == "publish" else "released", first):
+                print(f"RELEASE=note: the {step} approval was replaced after the release went out; the new record is left unused")
     return public_check(run, name)
 
 
