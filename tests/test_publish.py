@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from helpers import FakeGitHub, UploadCase, fake_repo
+from helpers import CHECK, FakeGitHub, UploadCase, fake_repo
 
 REPO = "acme/widgets"
 
@@ -749,8 +750,46 @@ class PublishCases(UploadCase):
         self.assertFalse(any(a[:2] == ["release", "create"] for a in self.github.read()["log"]))
         rec = json.loads(path.read_text())
         self.assertIsNone(rec.get("used"), "the replacing record approved nothing and stays unused")
-        got = self.publish(run)  # a resume takes the replacing record, which names no release
+        got = self.publish(run)  # a resume: the replacing record did not make the switch, so its release does not go
+        self.assertEqual(got.returncode, 1)
+        self.assertIn("is not the one that made the switch (unused)", got.stdout)
         self.assertFalse(any(a[:2] == ["release", "create"] for a in self.github.read()["log"]))
+
+    def test_a_release_approval_recorded_during_the_switch_stops_approval_twos_release(self) -> None:
+        run = self.ready_to_publish(*self.release_args())
+        pub = json.loads((run / "approvals" / "publish.json").read_text())
+        other = {**pub, "step": "release", "recorded_at": "2026-01-02T03:04:08+00:00", "used": None}
+        self.github.update(lambda st: st.update({"edit_writes_file": [str(run / "approvals" / "release.json"), json.dumps(other)]}))
+        got = self.publish(run)
+        self.assertEqual(got.returncode, 1)
+        self.assertIn("PUBLISH=ok", got.stdout)
+        self.assertIn("a release approval was recorded while this command ran", got.stdout)
+        self.assertFalse(any(a[:2] == ["release", "create"] for a in self.github.read()["log"]))
+
+    def test_approval_two_is_refused_once_the_repository_is_public(self) -> None:
+        run = self.ready_to_publish()
+        self.assertEqual(self.publish(run).returncode, 0)
+        got = self.approve(run, "publish", *self.release_args())
+        self.assertEqual(got.returncode, 1)
+        self.assertIn("approval 2 is for switching a private repository to public", got.stdout)
+
+    def test_a_revoke_waits_for_a_change_in_progress(self) -> None:
+        import fcntl
+        import time
+        run = self.ready_to_publish()
+        lock = open(run / "approvals" / ".records.lock", "a")
+        fcntl.flock(lock, fcntl.LOCK_EX)  # another command is changing a record
+        try:
+            proc = subprocess.Popen([sys.executable, "-I", str(CHECK), "revoke", "--run", str(run), "--step", "publish", "--words", "stop"],
+                                    env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)  # fmt: skip
+            time.sleep(0.5)
+            self.assertIsNone(proc.poll(), "revoke must wait for the lock")
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            lock.close()
+        out, _ = proc.communicate(timeout=30)
+        self.assertIn("REVOKED publish", out)
+        self.assertIn("revoked", json.loads((run / "approvals" / "publish.json").read_text()))
 
     def test_preflight_waits_for_the_activity_log(self) -> None:
         run = self.pushed()

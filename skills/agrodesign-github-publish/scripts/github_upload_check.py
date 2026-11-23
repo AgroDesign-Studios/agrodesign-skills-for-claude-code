@@ -87,6 +87,7 @@ from __future__ import annotations
 import argparse
 import base64
 import errno
+import fcntl
 import hashlib
 import io
 import json
@@ -105,6 +106,7 @@ import urllib.request
 import zipfile
 import zlib
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1885,10 +1887,12 @@ def approval_closed(rec: dict[str, Any]) -> str | None:
     return approval_expired(rec)
 
 
-def approval_problems(run: Path, step: str, digest: str, meta: dict[str, Any], *, used_ok: str | None = None, same_as: object = None) -> list[str]:
+def approval_problems(run: Path, step: str, digest: str, meta: dict[str, Any], *, used_as: str | None = None, same_as: object = None) -> list[str]:
     """Why the recorded approval for ``step`` does not cover this action (empty: it does).
     ``same_as``: the record read when the action began — the last check must find that very
-    record (a revoke and a new approval while the action ran stop it)."""
+    record (a revoke and a new approval while the action ran stop it). ``used_as``: the
+    record must already have been used with that result (the publish approval that made the
+    switch, for its release); without it, a used record is refused."""
     rec = _json_file(approval_file(run, step))
     if not isinstance(rec, dict):
         return [f"no {step} approval: record the owner's words first (approve --step {step})"]
@@ -1914,7 +1918,10 @@ def approval_problems(run: Path, step: str, digest: str, meta: dict[str, Any], *
         problems.append(f"the {step} approval was revoked at {revoked.get('at')}")
     if expired:
         problems.append(f"the {step} approval {expired}")
-    if used and not (used_ok and used.get("result") == used_ok):  # a publish approval covers its one release after the switch
+    if used_as is not None:  # a publish approval covers its one release only after it made the switch
+        if not (used and used.get("result") == used_as):
+            problems.append(f"the {step} approval is not the one that made the switch ({'used: ' + str(used.get('result')) if used else 'unused'}): a release needs approve --step release now")
+    elif used:
         problems.append(f"the {step} approval was used at {used.get('at')} ({used.get('result')})")
     return problems
 
@@ -1927,16 +1934,35 @@ def same_approval(rec: object, other: object) -> bool:
     return isinstance(rec, dict) and isinstance(other, dict) and all(rec.get(k) == other.get(k) for k in APPROVAL_KEYS)
 
 
+@contextmanager
+def records_lock(run: Path) -> Iterator[None]:
+    """One change of an approval record at a time (approve, revoke, the mark of use): each
+    reads the record and writes it back, and two at once would lose one of the changes —
+    a revoke overwritten by a mark of use would let a revoked approval go on."""
+    folder = run / "approvals"
+    folder.mkdir(parents=True, exist_ok=True)
+    with open(folder / ".records.lock", "a", encoding="utf-8") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 def mark_used(run: Path, step: str, result: str, expect: object) -> bool:
     """Mark the approval ``expect`` (the record the command started with) used. False, and
-    nothing written, when the file now holds another record: that one was never used."""
+    nothing written, when the file now holds another record (that one was never used) or
+    the record was revoked meanwhile (the revoke stands)."""
     path = approval_file(run, step)
-    rec = _json_file(path)
-    if not same_approval(rec, expect):
-        return False
-    assert isinstance(rec, dict)
-    rec["used"] = {"at": _now().isoformat(timespec="seconds"), "result": result}
-    _write_json(path, rec)
+    with records_lock(run):
+        rec = _json_file(path)
+        if not same_approval(rec, expect):
+            return False
+        assert isinstance(rec, dict)
+        if isinstance(rec.get("revoked"), dict):
+            return False
+        rec["used"] = {"at": _now().isoformat(timespec="seconds"), "result": result}
+        _write_json(path, rec)
     return True
 
 
@@ -2010,6 +2036,9 @@ def cmd_approve(run: Path, step: str, name: str, words: str, minutes: int | None
             problems.append("no clean preflight for this repository and digest: run preflight first (PREFLIGHT=ok)")
         else:
             preflight = str(pf.get("match"))
+        published = state.get("published")
+        if meta.get("private") is not True or (isinstance(published, dict) and published.get("repo_id") == meta.get("id")):
+            problems.append("approval 2 is for switching a private repository to public; this one is public or this run already published it — a release on it needs approve --step release")
     if step == "release" and not release_allowed(state, meta):
         problems.append("a release approval on its own is for a public repository this run pushed to, or one it made public (before a switch, the publish approval covers the release)")
     release = None
@@ -2019,6 +2048,12 @@ def cmd_approve(run: Path, step: str, name: str, words: str, minutes: int | None
         problems.append("--release-tag, --release-target, --release-title and --release-notes are needed")
     if step == "push" and rel.release_tag:
         problems.append("a push approval never covers a release (the release is part of approval 2)")
+    with records_lock(run):
+        return _record_approval(run, step, meta, digest, manifest, preflight, release, words, minutes, problems)
+
+
+def _record_approval(run: Path, step: str, meta: dict[str, Any], digest: str, manifest: dict[str, object], preflight: str | None,
+                     release: dict[str, object] | None, words: str, minutes: int | None, problems: list[str]) -> int:  # fmt: skip
     path = approval_file(run, step)
     old = _json_file(path)
     if isinstance(old, dict) and approval_closed(old) is None:
@@ -2054,12 +2089,13 @@ def cmd_approve(run: Path, step: str, name: str, words: str, minutes: int | None
 
 def cmd_revoke(run: Path, step: str, words: str) -> int:
     path = approval_file(run, step)
-    rec = _json_file(path)
-    if not isinstance(rec, dict):
-        print(f"REVOKE=none: no {step} approval recorded")
-        return 1
-    rec["revoked"] = {"at": _now().isoformat(timespec="seconds"), "words": words}
-    _write_json(path, rec)
+    with records_lock(run):
+        rec = _json_file(path)
+        if not isinstance(rec, dict):
+            print(f"REVOKE=none: no {step} approval recorded")
+            return 1
+        rec["revoked"] = {"at": _now().isoformat(timespec="seconds"), "words": words}
+        _write_json(path, rec)
     print(f"REVOKED {step} (recorded {rec.get('recorded_at')})")
     return 0
 
@@ -2685,14 +2721,22 @@ def _publish(run: Path, name: str, title: Path | None, notes: Path | None, asset
         else:
             spec, step, first = None, "", None
         if spec is not None:
-            used_ok = "published" if step == "publish" else None
-            problems = approval_problems(run, step, digest, meta, used_ok=used_ok, same_as=first)
+            used_as = "published" if step == "publish" else None
+
+            def release_problems() -> list[str]:
+                found = approval_problems(run, step, digest, meta, used_as=used_as, same_as=first)
+                now = _json_file(approval_file(run, "release"))
+                if rel is None and now is not None:  # recorded while this ran: it decides, so approval 2's release does not go
+                    found.append("a release approval was recorded while this command ran: run publish again (that approval decides the release)")
+                return found
+
+            problems = release_problems()
             bad = release_files_problem(spec, title, notes, assets)
             if bad:
                 problems.append(bad)
             if problems:
                 return _refuse("RELEASE", problems)
-            if do_release(run, name, spec, lambda: approval_problems(run, step, digest, meta, used_ok=used_ok, same_as=first)) != 0:
+            if do_release(run, name, spec, release_problems) != 0:
                 return 1
             if not mark_used(run, step, "published+released" if step == "publish" else "released", first):
                 print(f"RELEASE=note: the {step} approval was replaced after the release went out; the new record is left unused")
