@@ -1765,6 +1765,22 @@ def gh_api(path: str, *, missing_ok: bool = False) -> object:
         raise GhError(f"gh api {path}: not JSON") from exc
 
 
+def gh_api_graphql(query: str, **variables: str) -> object:
+    args = ["api", "graphql", "-f", f"query={query}"]
+    for k, v in variables.items():
+        args += ["-F", f"{k}={v}"]
+    proc = gh(*args)
+    if proc.returncode != 0:
+        raise GhError(f"gh api graphql: {safe((proc.stderr.strip() or proc.stdout.strip())[-300:])}")
+    try:
+        got = json.loads(proc.stdout or "null")
+    except ValueError as exc:
+        raise GhError("gh api graphql: not JSON") from exc
+    if isinstance(got, dict) and got.get("errors"):
+        raise GhError(f"gh api graphql: {safe(json.dumps(got['errors'])[:300])}")
+    return got
+
+
 def gh_list(path: str) -> list[object]:
     """Every page of a list endpoint (per_page=100), or GhError."""
     sep = "&" if "?" in path else "?"
@@ -1851,12 +1867,16 @@ def approval_closed(rec: dict[str, Any]) -> str | None:
     return approval_expired(rec)
 
 
-def approval_problems(run: Path, step: str, digest: str, meta: dict[str, Any], *, used_ok: str | None = None) -> list[str]:
-    """Why the recorded approval for ``step`` does not cover this action (empty: it does)."""
+def approval_problems(run: Path, step: str, digest: str, meta: dict[str, Any], *, used_ok: str | None = None, same_as: object = None) -> list[str]:
+    """Why the recorded approval for ``step`` does not cover this action (empty: it does).
+    ``same_as``: the record read when the action began — the last check must find that very
+    record (a revoke and a new approval while the action ran stop it)."""
     rec = _json_file(approval_file(run, step))
     if not isinstance(rec, dict):
         return [f"no {step} approval: record the owner's words first (approve --step {step})"]
     problems: list[str] = []
+    if isinstance(same_as, dict) and any(rec.get(k) != same_as.get(k) for k in ("recorded_at", "digest", "preflight", "release", "pushes")):
+        problems.append(f"the {step} approval was replaced while this command ran: run it again")
     if rec.get("format") != 1 or rec.get("step") != step or not str(rec.get("owner_words") or "").strip():
         problems.append(f"approvals/{step}.json is malformed or holds no owner's words")
     if rec.get("digest") != digest:
@@ -1912,11 +1932,11 @@ def release_spec(manifest: dict[str, object], tag: str, target: str, title: Path
     if not text or "\n" in text:
         die(f"--release-title {title}: one non-empty line")
     names = [a.name for a in assets]
-    odd = [n for n in names if not ASSET_NAME.fullmatch(n)]
+    odd = [n for n in names if not ASSET_NAME.fullmatch(n) or n.endswith(".")]
     if odd:  # gh reads "name#label", and GitHub rewrites spaces and some characters in asset names
         die(f"--release-asset: rename {', '.join(odd)} to letters, digits, '.', '_' and '-' only (GitHub would publish another name)")
-    if len(set(names)) != len(names):
-        die("--release-asset: two assets share a name")
+    if len({n.lower() for n in names}) != len(names):
+        die("--release-asset: two assets share a name (GitHub compares asset names without case)")
     title_sha, title_path = staged_file(manifest, title, "--release-title")
     notes_sha, notes_path = staged_file(manifest, notes, "--release-notes")
     staged_assets = [(a.name, *staged_file(manifest, a, "--release-asset")) for a in assets]
@@ -2089,7 +2109,7 @@ def _push(run: Path, sources: list[Source]) -> int:
     problems = approval_problems(run, "push", digest, meta)
     problems += [f"the run pushes to {safe(p['url'])}, which is not {meta.get('full_name')}" for p in push_rows(manifest) if norm_url(p["url"]) not in repo_urls(meta)]
     problems += [b for b in (base_problem(p) for p in manifest["pushes"]) if b]  # type: ignore[union-attr]
-    problems = problems or approval_problems(run, "push", digest, meta)  # again, last: a revoke during the reads stops it
+    problems = problems or approval_problems(run, "push", digest, meta, same_as=rec)  # again, last: a revoke during the reads stops it
     if problems:
         for p in problems:
             print(f"PUSH=refused: {p}")
@@ -2159,6 +2179,9 @@ def preflight_check(run: Path, name: str, *, after_switch: bool = False) -> tupl
     try:
         activity = [a for a in gh_list(f"repos/{name}/activity") if isinstance(a, dict)]
         inv["activity"] = len(activity)
+        for p in pushes:
+            if not any(str(a.get("ref")) == str(p["ref"]) and str(a.get("after")) == str(p.get("commit") or p["tip"]) for a in activity):
+                problems.append(f"GitHub's activity log does not show this run's push of {p['ref']} yet (it can lag): wait, then run preflight again")
         tips = {str(p["ref"]): (Path(str(p["repo"])), str(p.get("commit") or p["tip"])) for p in pushes}
         for a in activity:
             kind, ref, after = str(a.get("activity_type")), str(a.get("ref")), str(a.get("after") or "")
@@ -2176,6 +2199,22 @@ def preflight_check(run: Path, name: str, *, after_switch: bool = False) -> tupl
             problems.append(f"the repository was created {age.days} days ago: GitHub's activity log covers {ACTIVITY_DAYS} days, so its ref history cannot all be read")
     except ValueError:
         problems.append("the repository's creation time is unreadable")
+    owner, _, short = name.partition("/")
+    query = ("query($owner:String!,$name:String!){repository(owner:$owner,name:$name)"
+             "{packages(first:1){totalCount} usesCustomOpenGraphImage}}")
+    try:
+        got = gh_api_graphql(query, owner=owner, name=short)
+        repo_g = got.get("data", {}).get("repository") if isinstance(got, dict) else None
+        if not isinstance(repo_g, dict) or not isinstance(repo_g.get("packages"), dict):
+            raise GhError("graphql: no repository in the answer")
+        inv["packages"] = int(repo_g["packages"].get("totalCount") or 0)
+        inv["custom_social_image"] = bool(repo_g.get("usesCustomOpenGraphImage"))
+        if inv["packages"]:
+            problems.append(f"packages: {inv['packages']} — a package linked to the repository may become public with it; never checked")
+        if inv["custom_social_image"]:
+            problems.append("a custom social preview image was uploaded: never checked — remove it first")
+    except GhError as exc:
+        problems.append(f"could not read packages and the social preview image: {exc}")
     for p in pushes:  # statuses and check runs on the checked commits become public too
         commit = str(p.get("commit") or p["tip"])
         try:
@@ -2304,7 +2343,7 @@ def cmd_preflight(run: Path, name: str) -> int:
     _write_json(run / "preflight.json", {"format": 1, "digest": digest, "repo": inv.get("repo", {}), "checked_at": _now().isoformat(timespec="seconds"),
                                          "inventory": inv, "match": match, "problems": problems})  # fmt: skip
     for key in ("refs", "metadata", "issues_and_pull_requests", "commit_comments", "releases", "tags", "milestones", "deployments", "forks",
-                "actions_runs", "actions_artifacts", "environments", "labels", "rulesets", "pages_site", "features", "wiki_refs", "activity"):  # fmt: skip
+                "actions_runs", "actions_artifacts", "environments", "labels", "rulesets", "pages_site", "features", "wiki_refs", "activity", "packages", "custom_social_image"):  # fmt: skip
         if key in inv:
             print(f"INVENTORY {key} {safe(json.dumps(inv[key], ensure_ascii=False))[:300]}")
     for p in problems:
@@ -2505,7 +2544,7 @@ def _publish(run: Path, name: str, title: Path | None, notes: Path | None, asset
     reverted = state.get("reverted")
     if isinstance(reverted, dict):
         fresh = (reverted.get("kind") == "read failure" and reverted.get("ok") and meta.get("private") is True and isinstance(pub, dict)
-                 and approval_closed(pub) is None and str(pub.get("recorded_at")) > str(reverted.get("at")))  # fmt: skip
+                 and approval_closed(pub) is None and str(pub.get("recorded_at")) >= str(reverted.get("at")))  # fmt: skip
         if not fresh:
             if reverted.get("kind") == "read failure" and reverted.get("ok"):
                 print("PUBLISH=refused: a read failed right after this run's switch and it was switched back; run preflight, ask the owner again, record a new publish approval, then publish")
@@ -2550,7 +2589,7 @@ def _publish(run: Path, name: str, title: Path | None, notes: Path | None, asset
             problems += pre
             if not pre and isinstance(pub, dict) and inventory_match(inv, digest) != pub.get("preflight"):
                 problems.append("the destination changed since the approved preflight: run preflight and ask the owner again")
-            problems = problems or approval_problems(run, "publish", digest, meta)  # again, last: a revoke during the reads stops it
+            problems = problems or approval_problems(run, "publish", digest, meta, same_as=pub)  # again, last: a revoke during the reads stops it
             if problems:
                 return _refuse("PUBLISH", problems)
             save_state(run, publishing={"at": _now().isoformat(timespec="seconds"), "repo_id": meta.get("id")})
@@ -2590,7 +2629,8 @@ def _publish(run: Path, name: str, title: Path | None, notes: Path | None, asset
                 problems.append(bad)
             if problems:
                 return _refuse("RELEASE", problems)
-            if do_release(run, name, spec, lambda: approval_problems(run, step, digest, meta, used_ok=used_ok)) != 0:
+            first = _json_file(approval_file(run, step))
+            if do_release(run, name, spec, lambda: approval_problems(run, step, digest, meta, used_ok=used_ok, same_as=first)) != 0:
                 return 1
             mark_used(run, step, "published+released" if step == "publish" else "released")
     return public_check(run, name)

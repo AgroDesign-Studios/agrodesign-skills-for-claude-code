@@ -157,8 +157,8 @@ python3 -I <skill>/scripts/github_upload_check.py preflight --run <run> --repo <
 `preflight` reads, page by page, everything the switch would expose, and writes `<run>/preflight.json` with a match hash. `PREFLIGHT=ok` only when:
 
 - the repository is private, not a fork, template or archived, this account is its admin, approval 1 was given and used for it (same id), and this run recorded its push there;
-- GitHub's activity log for the repository (every page) holds only plain pushes and branch creations of commits inside this run's checked history — a force push or a deleted branch leaves commits on GitHub that anyone can fetch by id once it is public; the log covers 90 days, so a repository created longer ago is refused;
-- the checked commits carry no commit statuses or check runs (their texts and links become public too);
+- GitHub's activity log for the repository (every page) holds only plain pushes and branch creations of commits inside this run's checked history — a force push or a deleted branch leaves commits on GitHub that anyone can fetch by id once it is public; the log covers 90 days, so a repository created longer ago is refused, and it must already show this run's own push (GitHub records it late: wait and run preflight again);
+- the checked commits carry no commit statuses or check runs (their texts and links become public too); no package is linked to the repository and no custom social preview image was uploaded;
 - every ref the destination has (`git ls-remote`, GitHub's own refs such as `refs/pull/*` included; read last) is exactly one of this run's checked pushes, and every push is there;
 - the live description, homepage and topics equal the staged ones;
 - there are no issues or pull requests (closed ones and their comments included), commit comments, releases, tags other than a checked push, milestones, deployments, environments, Actions runs or artefacts (their logs become public too), forks, or labels beyond GitHub's defaults; no Pages site; the wiki and discussions are off, and the wiki's own git repository holds no pages (switched off, it keeps them);
@@ -166,7 +166,7 @@ python3 -I <skill>/scripts/github_upload_check.py preflight --run <run> --repo <
 
 Rulesets are listed (push rulesets stop applying once a repository is public), and the creation time is shown: "new and empty" is what the inventory proves — no history, issues or settings beyond the checked pushes — not a date. `INVENTORY` lines show what was read; `PREFLIGHT=refused` lines say what stands in the way. Anything not checked — an old repository with issues, a wiki, other people's pushes — is out of scope: make a new repository, push the checked history to it, and switch that one.
 
-Report the inventory to the owner with the repository's URL and, if a release is wanted, its tag, target commit (a commit this run pushed), title, notes and assets — each a staged `--file` of this run, an asset named with letters, digits, `.`, `_` and `-` only (GitHub rewrites other names). **Stop here** and ask for approval 2: "make <URL> visible to everyone [and create release <tag> at <commit> with this title and notes]". The release is optional; ask for it explicitly or leave it out.
+Report the inventory to the owner with the repository's URL and, if a release is wanted, its tag, target commit (a commit this run pushed), title, notes and assets — each a staged `--file` of this run, an asset named with letters, digits, `.`, `_` and `-` only, not ending in `.`, and no two names that differ only in case (GitHub rewrites or merges such names). **Stop here** and ask for approval 2: "make <URL> visible to everyone [and create release <tag> at <commit> with this title and notes]". The release is optional; ask for it explicitly or leave it out.
 
 ## Step 9 — Approval 2, then the switch and the release
 
@@ -187,7 +187,7 @@ If a step fails or times out, run `publish` again: it reads `state.json` and Git
 
 ## Stopping
 
-The owner can stop at any point before a step runs — `push` and `publish` read the approval once more right before each `git push`, switch and release, so a revoke recorded while they read GitHub still stops them. Record it at once with `revoke --run <run> --step push|publish|release --words "<their words>"` — `publish` stops both the switch and the release approval 2 named; `release` stops a release approved on its own. The record stays, marked revoked, and no command uses it again; a later go-ahead is a new approval. What already happened cannot be undone: a push stays on the destination, and switching back to private does not recall copies or public forks made meanwhile — say so plainly when you report.
+The owner can stop at any point before a step runs — `push` and `publish` read the approval once more right before each `git push`, switch and release, so a revoke recorded while they read GitHub still stops them — and so does a new approval recorded meanwhile (the last check must find the very record the command started with). Record it at once with `revoke --run <run> --step push|publish|release --words "<their words>"` — `publish` stops both the switch and the release approval 2 named; `release` stops a release approved on its own. The record stays, marked revoked, and no command uses it again; a later go-ahead is a new approval. What already happened cannot be undone: a push stays on the destination, and switching back to private does not recall copies or public forks made meanwhile — say so plainly when you report.
 
 ## Never
 

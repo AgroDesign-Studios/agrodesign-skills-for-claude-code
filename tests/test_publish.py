@@ -15,6 +15,18 @@ from helpers import FakeGitHub, UploadCase, fake_repo
 
 REPO = "acme/widgets"
 
+#: The made-up destination's post-receive hook: each ref update becomes an activity event.
+POST_RECEIVE = r"""#!/usr/bin/env python3
+import json, sys
+path = "@STATE@"
+st = json.load(open(path))
+for line in sys.stdin:
+    old, new, ref = line.split()
+    kind = "branch_creation" if set(old) == {"0"} else ("branch_deletion" if set(new) == {"0"} else "push")
+    st.setdefault("lists", {}).setdefault("activity", []).append({"activity_type": kind, "ref": ref, "before": old, "after": new})
+json.dump(st, open(path, "w"), indent=1)
+"""
+
 
 def git(repo: Path, *args: str) -> str:
     return subprocess.run(
@@ -44,6 +56,10 @@ class PublishCases(UploadCase):
         self.addCleanup(self.github.stop)
         self.github.update(lambda st: st["repos"].update({REPO: fake_repo(REPO, str(self.dest))}))
         self.env = {**self.env, "AGRODESIGN_GITHUB_PUBLISH_GH_BIN": str(self.github.gh), "AGRODESIGN_GITHUB_PUBLISH_API_URL": self.github.api_url, "AGRODESIGN_GITHUB_PUBLISH_RETRY_SECONDS": "0.05"}
+        # Every push to the made-up destination lands in its activity log, as on GitHub.
+        hook = self.dest / "hooks" / "post-receive"
+        hook.write_text(POST_RECEIVE.replace("@STATE@", str(self.github.path)))
+        hook.chmod(0o755)
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def sources(self, whole: bool = True) -> list[str]:
@@ -663,6 +679,47 @@ class PublishCases(UploadCase):
         self.assertEqual(got.returncode, 1)
         self.assertIn("1 status(es) and 1 check run(s)", got.stdout)
         self.assertIn("activity log covers 90 days", got.stdout)
+
+    # ── from the in-house copy's list ────────────────────────────────────────
+    def test_an_approval_replaced_mid_run_stops_the_switch(self) -> None:
+        run = self.ready_to_publish(*self.release_args())
+        path = str(run / "approvals" / "publish.json")
+        self.github.update(lambda st: st.update({"api_calls": 0, "replace_file": path, "replace_after_calls": 3}))
+        got = self.publish(run)
+        self.assertEqual(got.returncode, 1)
+        self.assertIn("was replaced while this command ran", got.stdout)
+        self.assertEqual(self.visibility(), "private")
+
+    def test_preflight_waits_for_the_activity_log(self) -> None:
+        run = self.pushed()
+        self.github.update(lambda st: st["lists"].update({"activity": []}))
+        got = self.run_check("preflight", "--run", str(run), "--repo", REPO)
+        self.assertEqual(got.returncode, 1)
+        self.assertIn("does not show this run's push", got.stdout)
+
+    def test_packages_and_a_custom_social_image_are_refused(self) -> None:
+        run = self.pushed()
+        self.github.update(lambda st: st.update({"graphql": {"packages": {"totalCount": 2}, "usesCustomOpenGraphImage": True}}))
+        got = self.run_check("preflight", "--run", str(run), "--repo", REPO)
+        self.assertEqual(got.returncode, 1)
+        self.assertIn("packages: 2", got.stdout)
+        self.assertIn("custom social preview image", got.stdout)
+
+    def test_asset_names_that_end_in_a_dot_or_differ_only_in_case(self) -> None:
+        run = self.pushed()
+        self.run_check("preflight", "--run", str(run), "--repo", REPO)
+        dotted = self.tmp / "release" / "widgets."
+        dotted.write_bytes(b"x")
+        got = self.approve(run, "publish", *self.release_args(), "--release-asset", str(dotted))
+        self.assertEqual(got.returncode, 2)
+        self.assertIn("rename", got.stderr)
+        (self.tmp / "release" / "a").mkdir()
+        one, two = self.tmp / "release" / "Widgets.zip", self.tmp / "release" / "a" / "widgets.zip"
+        one.write_bytes(b"1")
+        two.write_bytes(b"2")
+        got = self.approve(run, "publish", *self.release_args(), "--release-asset", str(one), "--release-asset", str(two))
+        self.assertEqual(got.returncode, 2)
+        self.assertIn("without case", got.stderr)
 
     def test_url_spellings_are_one_repository(self) -> None:
         import importlib.util

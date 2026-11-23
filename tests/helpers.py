@@ -67,6 +67,12 @@ if args[:1] == ["api"]:
     if st["api_calls"] == st.get("private_at_call"):  # someone switches it back mid-run
         for r in st["repos"].values():
             r["private"], r["visibility"] = True, "private"
+    if st.get("replace_file") and st["api_calls"] == st.get("replace_after_calls"):  # revoked, and a new approval recorded mid-run
+        rec = json.load(open(st["replace_file"]))
+        rec["recorded_at"] = "2026-01-02T03:04:06+00:00"
+        json.dump(rec, open(st["replace_file"], "w"))
+    if args[:2] == ["api", "graphql"]:
+        out({"data": {"repository": st.get("graphql", {"packages": {"totalCount": 0}, "usesCustomOpenGraphImage": False})}})
     path = args[-1]
     bare, _, query = path.partition("?")
     q = dict(kv.split("=", 1) for kv in query.split("&") if "=" in kv)
