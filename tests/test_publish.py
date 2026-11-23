@@ -278,6 +278,31 @@ class PublishCases(UploadCase):
         self.assertIn("not the approved release notes", got.stdout)
         self.assertEqual(self.visibility(), "private")
 
+    def test_a_release_tag_is_a_version_number_only(self) -> None:
+        run = self.pushed()
+        self.run_check("preflight", "--run", str(run), "--repo", REPO)
+        for tag in ("zeta-cluster-fix", "v1.0.0-internal", "release/1.0"):
+            with self.subTest(tag=tag):
+                args = self.release_args()
+                args[1] = tag
+                got = self.approve(run, "publish", *args)
+                self.assertEqual(got.returncode, 2)
+                self.assertIn("a version number only", got.stderr)
+        for tag in ("v1.0.0", "2.1", "v2.0.0-rc.1"):
+            with self.subTest(tag=tag):
+                args = self.release_args()
+                args[1] = tag
+                got = self.approve(run, "publish", *args)
+                self.assertEqual(got.returncode, 0, got.stdout + got.stderr)
+                self.run_check("revoke", "--run", str(run), "--step", "publish", "--words", "next")
+
+    def test_rulesets_are_refused(self) -> None:
+        run = self.pushed()
+        self.github.update(lambda st: st["lists"].update({"rulesets": [{"name": "zeta-protect", "target": "branch", "enforcement": "active"}]}))
+        got = self.run_check("preflight", "--run", str(run), "--repo", REPO)
+        self.assertEqual(got.returncode, 1)
+        self.assertIn("1 ruleset(s) were never checked", got.stdout)
+
     def test_release_target_must_be_a_pushed_commit(self) -> None:
         run = self.pushed()
         self.run_check("preflight", "--run", str(run), "--repo", REPO)

@@ -335,16 +335,17 @@ async function verifyFindings(row, report) {
         // votes refute it, and only votes cast AT the required tier on the commit under
         // review count. A skeptic that died is non-refuting, and so is a REFUTE from a
         // skeptic that answered below tier — the opus fallback this file launched, or a
-        // top-tier vote whose `ran_on` does not name Fable alone ("unknown", junk, or a
-        // report that also names another family count the same) — or one that saw
+        // vote whose `ran_on` does not name its tier ("unknown", junk, or a report that
+        // also names another family count the same) — or one that saw
         // another commit. Those may CONFIRM but never ERASE: their refutations are kept
         // as advisory reasoning and counted apart for the orchestrator's judgment. With
         // VOTES=1 a single dead skeptic => refutes 0 of 1 => the finding stands.
-        // Top tier: an allowlist (only a report naming Fable alone counts). Opus: a report
-        // naming only a lower family (a switch to sonnet or haiku) does not count.
+        // Both tiers are allowlists: at the top tier only a report naming Fable alone counts;
+        // at Opus only a report naming Opus or Fable and no lower family ("unknown", junk or
+        // a switch to sonnet or haiku may confirm, never erase).
         const namesOnlyFable = (s) => /fable/i.test(s) && !/opus|sonnet|haiku/i.test(s)
-        const namesOnlyLower = (s) => /sonnet|haiku/i.test(s) && !/opus|fable/i.test(s)
-        const atTier = (o) => !o.fallback && (o.requested.startsWith('fable/') ? namesOnlyFable(String(o.value.ran_on || '')) : !namesOnlyLower(String(o.value.ran_on || '')))
+        const namesOpusOrAbove = (s) => /opus|fable/i.test(s) && !/sonnet|haiku/i.test(s)
+        const atTier = (o) => !o.fallback && (o.requested.startsWith('fable/') ? namesOnlyFable(String(o.value.ran_on || '')) : namesOpusOrAbove(String(o.value.ran_on || '')))
         const onHead = (o) => sameHead(o.value.head_seen)
         const refutes = cast.filter((o) => o.value.refuted && atTier(o) && onHead(o)).length
         const substitutedRefutes = cast.filter((o) => o.value.refuted && o.fallback).length

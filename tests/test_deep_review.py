@@ -109,6 +109,14 @@ class EngineCases(unittest.TestCase):
         self.assertFalse(v["refuted"])
         self.assertEqual(v["tier_mismatch_refutes"], 1)
 
+    def test_opus_skeptic_that_names_no_model_cannot_refute(self) -> None:
+        for ran_on in ("unknown", "a large language model"):
+            with self.subTest(ran_on=ran_on):
+                out = self.run_engine(base_args(), [{"label": "^find:", "value": report([finding()])}, {"label": "^verify:", "value": verdict(True, ran_on=ran_on)}])
+                v = out["result"]["results"][0]["verdicts"][0]
+                self.assertFalse(v["refuted"])
+                self.assertEqual(v["tier_mismatch_refutes"], 1)
+
     def test_switched_top_tier_skeptic_cannot_refute(self) -> None:
         out = self.run_engine(base_args(), [{"label": "^find:", "value": report([finding("critical")])}, {"label": "^verify:", "value": verdict(True, ran_on="Fable 5.2, switched to Opus 5.5")}])
         v = out["result"]["results"][0]["verdicts"][0]

@@ -138,7 +138,9 @@ GH = os.environ.get("AGRODESIGN_GITHUB_PUBLISH_GH_BIN") or shutil.which("gh") or
 #: The REST API the anonymous check reads after a switch (no credentials are sent).
 API_URL = os.environ.get("AGRODESIGN_GITHUB_PUBLISH_API_URL", "https://api.github.com").rstrip("/")
 REPO_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}")
-TAG_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+/-]{0,99}")
+#: A release tag is a version number (v1.2.3, 1.0, v2.0.0-rc.1): it is published but is not
+#: part of the checked set, so it may not carry any other text.
+TAG_NAME = re.compile(r"v?[0-9]{1,6}(\.[0-9]{1,6}){0,3}(-(alpha|beta|rc)(\.?[0-9]{1,4})?)?")
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
 ASSET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}")
 #: Seconds between the reads right after a switch (GitHub can lag a moment); tests shorten it.
@@ -1981,7 +1983,7 @@ def staged_file(manifest: dict[str, object], path: Path, what: str) -> tuple[str
 
 def release_spec(manifest: dict[str, object], tag: str, target: str, title: Path, notes: Path, assets: list[Path]) -> dict[str, object]:
     if not TAG_NAME.fullmatch(tag) or ".." in tag or tag.endswith((".", "/", ".lock")):
-        die(f"--release-tag {tag!r}: not a plain tag name")
+        die(f"--release-tag {tag!r}: a version number only (v1.2.3, 1.0, v2.0.0-rc.1) — a tag is published but never checked, so it may carry no other text")
     commits = {str(p.get("commit")) for p in manifest.get("pushes") or []}  # type: ignore[union-attr]
     if not FULL_SHA.fullmatch(target) or target not in commits:
         die(f"--release-target {target!r}: give the full commit id this run pushes ({', '.join(sorted(commits)) or 'none'})")
@@ -2337,6 +2339,8 @@ def preflight_check(run: Path, name: str, *, after_switch: bool = False) -> tupl
         problems.append(f"could not read labels: {exc}")
     try:
         inv["rulesets"] = sorted(f"{x.get('name')} ({x.get('target')}, {x.get('enforcement')})" for x in gh_list(f"repos/{name}/rulesets") if isinstance(x, dict))
+        if inv["rulesets"]:  # their names, conditions and parameters are readable once public
+            problems.append(f"{len(inv['rulesets'])} ruleset(s) were never checked: delete them before the switch and add them again once it is public")
     except GhError as exc:
         problems.append(f"could not read rulesets: {exc}")
     try:

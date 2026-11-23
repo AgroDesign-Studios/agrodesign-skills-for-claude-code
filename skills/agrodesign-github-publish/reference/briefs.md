@@ -79,6 +79,11 @@ low = style.
 
 === UPLOAD SET ===
 <the whole text of bundle-NN.md follows here>
+
+=== END OF UPLOAD SET ===
+Now answer as asked above: the short paragraph, then as the LAST thing the one ```json block with
+"findings", "read" and "not_read", naming every file of this bundle — also when there are no
+findings (then "findings": []). An answer without that block is not accepted.
 ```
 
 ## Stage 4 — Grok
