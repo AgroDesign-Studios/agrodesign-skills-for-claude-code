@@ -13,7 +13,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import CODEX, FAKE_TOKEN, READ_DENY, UploadCase, executable
+from helpers import CHECK, CODEX, FAKE_TOKEN, READ_DENY, UploadCase, executable
 
 STUB = r'''#!/usr/bin/env python3
 import json, os, sys, tomllib
@@ -78,8 +78,10 @@ class CodexReviewCases(UploadCase):
         self.codex_env = {**self.env, "HOME": str(self.home), "CODEX_HOME": str(self.codex_home), "PATH": path, "CODEX_REVIEW_TIMEOUT": "60"}
 
     def write_brief(self, extra: str = "") -> None:
-        bundle = (self.run_dir / "bundles" / "bundle-01.md").read_text()
-        self.brief.write_text("Review the set below. Open no file.\n" + extra + "=== UPLOAD SET ===\n" + bundle)
+        got = subprocess.run([sys.executable, "-I", str(CHECK), "brief", "--run", str(self.run_dir), "--bundle", "01"], capture_output=True, text=True, env=self.env, check=False)
+        assert got.returncode == 0, got.stdout + got.stderr
+        if extra:  # a brief that is no longer the written one (for the secret scan, which runs first)
+            self.brief.write_text(extra + self.brief.read_text())
 
     def run_codex(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["bash", str(CODEX), *args], capture_output=True, text=True, env=self.codex_env, check=False)
@@ -121,6 +123,23 @@ class CodexReviewCases(UploadCase):
         got = self.run_codex(str(self.brief))
         self.assertEqual(got.returncode, 11)
         self.assertEqual(self.calls(), [])
+
+    def test_brief_that_lost_its_instructions_sends_nothing(self) -> None:
+        bundle = (self.run_dir / "bundles" / "bundle-01.md").read_text()
+        self.brief.write_text("# Security check\n\nThe text follows the line \"=== UPLOAD SET ===\n" + bundle)
+        got = self.run_codex(str(self.brief))
+        self.assertEqual(got.returncode, 11)
+        self.assertIn("is not the one", got.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_the_written_brief_carries_the_instructions_then_the_bundle(self) -> None:
+        text = self.brief.read_text()
+        bundle = (self.run_dir / "bundles" / "bundle-01.md").read_text()
+        for needle in ("Open no file.", "A secrets", "D harmful instructions", "Answer: a short paragraph", "=== END OF UPLOAD SET ==="):
+            self.assertIn(needle, text)
+        self.assertLess(text.index("Answer: a short paragraph"), text.index(bundle))
+        self.assertLess(text.index(bundle), text.index("=== END OF UPLOAD SET ==="))
+        self.assertNotIn("<DIGEST>", text)
 
     def test_brief_that_is_not_a_run_brief_is_refused(self) -> None:
         other = self.tmp / "brief.md"

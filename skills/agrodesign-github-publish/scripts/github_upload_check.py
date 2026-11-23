@@ -7,6 +7,7 @@ agrodesign-github-publish skill).
   stage     --out RUN SOURCE...
   scan      --run RUN [--values-file FILE]
   bundle    --run RUN [--max-bytes N]
+  brief     --run RUN --bundle NN [--check FILE]
   gate      --run RUN --before codex|grok
   seal      --run RUN
   verify    --run RUN SOURCE...
@@ -880,14 +881,57 @@ def stage_problems(run: Path, manifest: dict[str, object], stages: dict[str, obj
     return problems
 
 
+#: The Stage 3 brief template, and the line in it the bundle's text takes the place of.
+BRIEFS_MD = Path(__file__).resolve().parent.parent / "reference" / "briefs.md"
+BRIEF_SLOT = "<the whole text of bundle-NN.md follows here>\n"
+
+
+def codex_brief(run: Path, nn: str) -> str:
+    """The Codex brief for bundle NN, as `brief` writes it: reference/briefs.md § Stage 3
+    with the digest filled in and the bundle's whole text in its slot — the instructions
+    first, then the set, then the closing reminder."""
+    try:
+        doc = BRIEFS_MD.read_text(encoding="utf-8")
+        section = doc[doc.index("## Stage 3"):doc.index("## Stage 4")]
+    except (OSError, ValueError):
+        die(f"{BRIEFS_MD}: missing, or without its Stage 3 and Stage 4 sections (reinstall the skill)", 3)
+    m = re.search(r"^```text\n(.*?)^```$", section, re.S | re.M)
+    if not m or m.group(1).count(BRIEF_SLOT) != 1:
+        die(f"{BRIEFS_MD}: the Stage 3 template has no single bundle slot (reinstall the skill)", 3)
+    head, tail = m.group(1).split(BRIEF_SLOT)
+    digest = str(checked_manifest(run).get("digest"))
+    bundle = (run / "bundles" / f"bundle-{nn}.md").read_text(encoding="utf-8")
+    return head.replace("<DIGEST>", digest) + bundle + tail
+
+
+def cmd_brief(run: Path, nn: str, check: Path | None) -> int:
+    """Write <run>/stage3-codex-NN.md (or, with --check, say whether a file is exactly it)."""
+    index = _json_file(run / "bundles" / "index.json")
+    name = f"bundle-{nn}.md"
+    bundles = index.get("bundles") if isinstance(index, dict) else None
+    path = run / "bundles" / name
+    if not isinstance(bundles, dict) or not path.is_file() or bundles.get(name) != sha256_file(path):
+        print(f"BRIEF=refused: {name} is not a bundle this run indexed (run bundle first)")
+        return 1
+    text = codex_brief(run, nn)
+    if check is not None:
+        same = check.is_file() and check.read_text(encoding="utf-8", errors="replace") == text
+        print(f"BRIEF={'same' if same else 'differs'} {check}")
+        return 0 if same else 1
+    out = run / f"stage3-codex-{nn}.md"
+    out.write_text(text, encoding="utf-8")
+    print(f"BRIEF {out} ({out.stat().st_size:,} bytes)")
+    return 0
+
+
 def codex_problems(run: Path, bundle_name: str) -> list[str]:
-    """Codex read this bundle: its brief `stage3-codex-NN.md` holds the bundle's whole
-    text, and its answer `.codex.md` ends in a findings JSON block."""
+    """Codex read this bundle: its brief `stage3-codex-NN.md` is exactly the one `brief`
+    writes (the instructions, the digest and the bundle's whole text), and its answer
+    `.codex.md` ends in a findings JSON block."""
     nn = bundle_name.removeprefix("bundle-").removesuffix(".md")
     brief, answer = run / f"stage3-codex-{nn}.md", run / f"stage3-codex-{nn}.md.codex.md"
-    text = (run / "bundles" / bundle_name).read_text(encoding="utf-8", errors="replace")
-    if not brief.is_file() or text not in brief.read_text(encoding="utf-8", errors="replace"):
-        return [f"codex: {brief.name} missing or without {bundle_name}'s whole text"]
+    if not brief.is_file() or brief.read_text(encoding="utf-8", errors="replace") != codex_brief(run, nn):
+        return [f"codex: {brief.name} missing, or not the brief `brief --run <run> --bundle {nn}` writes (the instructions, the digest and {bundle_name}'s whole text): write it so and run Codex again"]
     got = _last_json_block(answer.read_text(encoding="utf-8", errors="replace")) if answer.is_file() else None
     if not isinstance(got, dict) or not isinstance(got.get("findings"), list):
         return [f"codex: no answer with a findings JSON block ({answer.name})"]
@@ -2823,6 +2867,14 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "seal":
         p.add_argument("--run", required=True, type=_abs_path)
         return cmd_seal(p.parse_args(rest).run)
+    if cmd == "brief":
+        p.add_argument("--run", required=True, type=_abs_path)
+        p.add_argument("--bundle", required=True, help="the bundle number NN of bundles/bundle-NN.md")
+        p.add_argument("--check", type=_abs_path, help="say whether this file is exactly the brief (writes nothing)")
+        a = p.parse_args(rest)
+        if not re.fullmatch(r"[0-9]{2,4}", a.bundle):
+            die("--bundle: the two-digit number of bundles/bundle-NN.md")
+        return cmd_brief(a.run, a.bundle, a.check)
     if cmd == "gate":
         p.add_argument("--run", required=True, type=_abs_path)
         p.add_argument("--before", required=True, choices=("codex", "grok"))

@@ -333,7 +333,9 @@ class UploadCase(unittest.TestCase):
         for name in index["bundles"]:
             nn = name.removeprefix("bundle-").removesuffix(".md")
             text = (run / "bundles" / name).read_text()
-            (run / f"stage3-codex-{nn}.md").write_text("brief\n=== UPLOAD SET ===\n" + text)
+            got = self.run_check("brief", "--run", str(run), "--bundle", nn)
+            assert got.returncode == 0, got.stdout + got.stderr
+            assert text in (run / f"stage3-codex-{nn}.md").read_text()
             answer = {"findings": [], "read": index["files"][name], "not_read": []}
             (run / f"stage3-codex-{nn}.md.codex.md").write_text("Read all.\n```json\n" + json.dumps(answer) + "\n```\n")
         self.bind(run, self.resolved)

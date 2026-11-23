@@ -12,8 +12,10 @@
 # THE ORDER IS ENFORCED HERE. The brief must be a run's Codex brief, and before anything
 # is sent `github_upload_check.py gate --run <run> --before codex` must say GATE=open
 # (the staged tree intact, the scan, its triage and Claude's answers for this digest,
-# the values file checked and unchanged, every hit and finding that needs it cleared), and the brief must hold the whole text
-# of the indexed bundle-NN.md. Otherwise nothing is sent (exit 11).
+# the values file checked and unchanged, every hit and finding that needs it cleared), and
+# the brief must be exactly what `github_upload_check.py brief --run <run> --bundle NN`
+# writes (reference/briefs.md § Stage 3 with the digest and the indexed bundle-NN.md's
+# whole text). Otherwise nothing is sent (exit 11).
 #
 # MODEL AND EFFORT are requested here, never inherited from ~/.codex/config.toml (which
 # is per account and can drift): CODEX_REVIEW_MODEL (default gpt-6-astra, the strongest
@@ -118,19 +120,6 @@ if [ "$GATE_RC" -ne 0 ]; then
   echo "$MARK=out-of-order — the gate before Codex is closed; nothing was sent" >&2
   exit 11
 fi
-if ! "$PY" -I - "$RUN" "$NN" "$PROMPT" <<'PY'
-import hashlib, json, sys
-run, nn, brief = sys.argv[1], sys.argv[2], sys.argv[3]
-index = json.load(open(f"{run}/bundles/index.json", encoding="utf-8"))
-name = f"bundle-{nn}.md"
-data = open(f"{run}/bundles/{name}", "rb").read()
-ok = index.get("bundles", {}).get(name) == hashlib.sha256(data).hexdigest() and data in open(brief, "rb").read()
-sys.exit(0 if ok else 1)
-PY
-then
-  echo "$MARK=out-of-order — the brief does not hold the whole text of the indexed bundle-$NN.md; nothing was sent" >&2
-  exit 11
-fi
 
 # The same secret shapes as github_upload_check.py's SECRET_PATTERNS.
 SECRET_CONTENT_RE='-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----|(^|[^0-9A-Za-z_-])(gh[pousr]_[0-9A-Za-z]{30,}|github_pat_[0-9A-Za-z_]{30,}|sk-ant-[0-9A-Za-z_-]{20,}|sk-[0-9A-Za-z_-]{32,}|xai-[0-9A-Za-z]{32,}|AIza[0-9A-Za-z_-]{35}|AKIA[0-9A-Z]{16}|xox[abposr]-[0-9A-Za-z-]{10,}|eyJ[0-9A-Za-z_-]{10,}\.eyJ[0-9A-Za-z_-]{10,}\.[0-9A-Za-z_-]{5,})'
@@ -164,6 +153,13 @@ fi
 if [ -n "$BRIEF_HIT" ]; then
   echo "$MARK=secret hit=$BRIEF_HIT — the brief scan found what looks like a secret, or could not run; nothing was sent" >&2
   exit 9
+fi
+# The brief must be exactly the one `github_upload_check.py brief` writes for this bundle:
+# the instructions (lenses, rules, answer form), the digest, the indexed bundle's whole
+# text and the closing — a hand-made brief that lost the instructions is refused.
+if ! "$PY" -I "$CHECK" brief --run "$RUN" --bundle "$NN" --check "$PROMPT" >/dev/null 2>&1; then
+  echo "$MARK=out-of-order — the brief is not the one \`github_upload_check.py brief --run <run> --bundle $NN\` writes (instructions, digest and the indexed bundle's whole text); nothing was sent" >&2
+  exit 11
 fi
 
 DENY_TABLE="$("$PY" -I "$READ_DENY" table "$CODEX_BIN" "${ROOTS[@]}" "${DENIES[@]}")" || {

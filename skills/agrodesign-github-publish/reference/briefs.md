@@ -37,13 +37,13 @@ attacker or identifies people; medium = internal detail of little use to an atta
 gap; low = style. End with a line `ran_on: <the model your system prompt names>`.
 ```
 
-## Stage 3 — Codex (codex_review.sh, gpt-6-astra / ultra; one brief per bundle, `<run>/stage3-codex-NN.md`)
+## Stage 3 — Codex (codex_review.sh, gpt-6-astra / ultra; one brief per bundle, written by `github_upload_check.py brief` to `<run>/stage3-codex-NN.md`)
 
 ```text
 # Security check before a PUBLIC GitHub upload (cannot be withdrawn)
 
-The whole text of what will be published follows the line "=== UPLOAD SET ===" at the end of
-this brief (set digest <DIGEST>). Each file starts with a line
+The whole text of what will be published follows the UPLOAD SET line near the end of this
+brief (set digest <DIGEST>). Each file starts with a line
 "===== FILE k/n: <path> (sha256 <16 hex>, <size> bytes) =====". A path ending in "~<40 hex>" is
 another version of the same file; trees/ holds folder listings; commits/ and tags/ hold the raw
 commit and tag objects.

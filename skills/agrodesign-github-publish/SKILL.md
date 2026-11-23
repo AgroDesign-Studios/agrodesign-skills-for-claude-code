@@ -86,14 +86,14 @@ Then start `<run>/cleared.json` — `{"digest": <DIGEST>, "bound": {"scan/report
 
 ## Step 3 — Codex (gpt-6-astra / ultra)
 
-For each bundle, write the brief from `reference/briefs.md` § Stage 3 with that bundle's whole text appended to `<run>/stage3-codex-NN.md`; then the gate, and Codex in the background, one bundle after another:
+For each bundle, write its brief with `python3 -I <skill>/scripts/github_upload_check.py brief --run <run> --bundle NN` (it fills `reference/briefs.md` § Stage 3 — the instructions, the digest, the bundle's whole text in its slot, the closing — into `<run>/stage3-codex-NN.md`; never write a brief by hand); then the gate, and Codex in the background, one bundle after another:
 
 ```bash
 python3 -I <skill>/scripts/github_upload_check.py gate --run <run> --before codex
 CODEX_REVIEW_TIMEOUT=2400 bash <skill>/scripts/codex_review.sh --root <each source folder or clone> [--deny <secret folder>]... <run>/stage3-codex-NN.md
 ```
 
-`codex_review.sh` runs the same gate itself and checks that the brief holds the whole indexed bundle; either failing sends nothing (exit 11).
+`codex_review.sh` runs the same gate itself and checks that the brief is exactly the one `brief` writes; either failing sends nothing (exit 11), and the seal checks the brief again.
 
 `GATE=open` only when the staged tree is intact and the scan, its triage and Claude's answers exist for this digest, the scan checked your values file and the file is unchanged since, and `cleared.json`, bound to them, resolves every mechanical hit and every Claude finding that needs it. The gates take no waivers: waiving Claude or Codex ends the run. `GATE=closed` lines say what is missing: nothing goes to OpenAI until it opens.
 
