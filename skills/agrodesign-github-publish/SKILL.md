@@ -157,7 +157,8 @@ python3 -I <skill>/scripts/github_upload_check.py preflight --run <run> --repo <
 `preflight` reads, page by page, everything the switch would expose, and writes `<run>/preflight.json` with a match hash. `PREFLIGHT=ok` only when:
 
 - the repository is private, not a fork, template or archived, this account is its admin, approval 1 was given and used for it (same id), and this run recorded its push there;
-- GitHub's activity log for the repository (every page) holds only plain pushes and branch creations of commits inside this run's checked history — a force push or a deleted branch leaves commits on GitHub that anyone can fetch by id once it is public;
+- GitHub's activity log for the repository (every page) holds only plain pushes and branch creations of commits inside this run's checked history — a force push or a deleted branch leaves commits on GitHub that anyone can fetch by id once it is public; the log covers 90 days, so a repository created longer ago is refused;
+- the checked commits carry no commit statuses or check runs (their texts and links become public too);
 - every ref the destination has (`git ls-remote`, GitHub's own refs such as `refs/pull/*` included; read last) is exactly one of this run's checked pushes, and every push is there;
 - the live description, homepage and topics equal the staged ones;
 - there are no issues or pull requests (closed ones and their comments included), commit comments, releases, tags other than a checked push, milestones, deployments, environments, Actions runs or artefacts (their logs become public too), forks, or labels beyond GitHub's defaults; no Pages site; the wiki and discussions are off, and the wiki's own git repository holds no pages (switched off, it keeps them);

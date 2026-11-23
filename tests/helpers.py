@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -84,6 +85,13 @@ if args[:1] == ["api"]:
         out({"total_count": st.get("totals", {}).get(rest, 0)})
     if rest == "pages":
         out({"url": "x"}) if st.get("pages") else fail(404, "Not Found")
+    t = re.match(r"^commits/([0-9a-f]+)/(statuses|check-runs)$", rest)
+    if t:
+        if t.group(2) == "check-runs":
+            out({"total_count": st.get("totals", {}).get("check-runs", 0)})
+        items = st.get("lists", {}).get("statuses", [])
+        page, per = int(q.get("page", 1)), int(q.get("per_page", 30))
+        out(items[(page - 1) * per: page * per])
     t = re.match(r"^git/ref/tags/(.+)$", rest)
     if t:
         sha = st.get("tag_refs", {}).get(t.group(1))
@@ -132,7 +140,7 @@ def fake_repo(name: str, clone_url: str, repo_id: int = 4242) -> dict[str, objec
     """A private, empty, new repository as GitHub's API describes one (made-up values)."""
     return {"id": repo_id, "node_id": f"R_test{repo_id}", "full_name": name, "private": True, "visibility": "private",
             "clone_url": clone_url, "ssh_url": f"git@github.example:{name}.git", "html_url": f"https://github.example/{name}",
-            "created_at": "2026-01-02T03:04:05Z", "description": "Made-up skills for tests", "homepage": None, "topics": [],
+            "created_at": (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ"), "description": "Made-up skills for tests", "homepage": None, "topics": [],
             "has_issues": False, "has_wiki": False, "has_discussions": False, "has_pages": False, "has_projects": False,
             "fork": False, "archived": False, "is_template": False, "permissions": {"admin": True, "push": True, "pull": True}}  # fmt: skip
 

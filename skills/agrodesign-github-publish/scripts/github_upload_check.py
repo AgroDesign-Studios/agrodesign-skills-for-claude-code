@@ -144,6 +144,8 @@ RETRY_SECONDS = float(os.environ.get("AGRODESIGN_GITHUB_PUBLISH_RETRY_SECONDS", 
 #: Labels every new GitHub repository starts with; any other label is text nobody checked.
 DEFAULT_LABELS = frozenset({"bug", "documentation", "duplicate", "enhancement", "good first issue", "help wanted", "invalid", "question", "wontfix"})
 PAGE_SIZE = 100
+#: GitHub keeps a repository's activity log (ref changes) for this many days.
+ACTIVITY_DAYS = 90
 MAX_PAGES = 100
 #: How long an approval stays usable unless the owner gives another window (minutes).
 APPROVAL_STEPS = ("push", "publish", "release")
@@ -2168,6 +2170,23 @@ def preflight_check(run: Path, name: str, *, after_switch: bool = False) -> tupl
                 problems.append(f"activity: {ref} once held {after[:12]}, outside this run's checked history")
     except GhError as exc:
         problems.append(f"could not read activity: {exc}")
+    try:  # the activity log covers 90 days: an older repository's ref history cannot all be read
+        age = _now() - datetime.fromisoformat(str(meta.get("created_at")).replace("Z", "+00:00"))
+        if age.days >= ACTIVITY_DAYS:
+            problems.append(f"the repository was created {age.days} days ago: GitHub's activity log covers {ACTIVITY_DAYS} days, so its ref history cannot all be read")
+    except ValueError:
+        problems.append("the repository's creation time is unreadable")
+    for p in pushes:  # statuses and check runs on the checked commits become public too
+        commit = str(p.get("commit") or p["tip"])
+        try:
+            statuses = len(gh_list(f"repos/{name}/commits/{commit}/statuses"))
+            checks = gh_total(f"repos/{name}/commits/{commit}/check-runs")
+        except GhError as exc:
+            problems.append(f"could not read the statuses or check runs of {commit[:12]}: {exc}")
+            continue
+        inv[f"statuses_{commit[:12]}"] = [statuses, checks]
+        if statuses or checks:
+            problems.append(f"{commit[:12]} carries {statuses} status(es) and {checks} check run(s) that were never checked")
     lists = {"issues_and_pull_requests": "issues?state=all", "pull_requests": "pulls?state=all", "commit_comments": "comments",
              "releases": "releases", "milestones": "milestones?state=all", "deployments": "deployments", "forks": "forks"}  # fmt: skip
     for label, path in lists.items():

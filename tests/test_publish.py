@@ -654,6 +654,16 @@ class PublishCases(UploadCase):
         self.github.update(lambda st: st["lists"].update({"activity": events[:1]}))
         self.assertEqual(self.run_check("preflight", "--run", str(run), "--repo", REPO).returncode, 0)
 
+    def test_statuses_on_a_checked_commit_and_an_old_repository_are_refused(self) -> None:
+        run = self.pushed()
+        self.github.update(lambda st: st["lists"].update({"statuses": [{"state": "success", "context": "ci"}]}))
+        self.github.update(lambda st: st["totals"].update({"check-runs": 1}))
+        self.github.update(lambda st: st["repos"][REPO].update({"created_at": "2020-01-02T03:04:05Z"}))
+        got = self.run_check("preflight", "--run", str(run), "--repo", REPO)
+        self.assertEqual(got.returncode, 1)
+        self.assertIn("1 status(es) and 1 check run(s)", got.stdout)
+        self.assertIn("activity log covers 90 days", got.stdout)
+
     def test_url_spellings_are_one_repository(self) -> None:
         import importlib.util
         import sys
