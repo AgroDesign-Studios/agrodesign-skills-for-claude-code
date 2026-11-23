@@ -312,6 +312,54 @@ class PublishCases(UploadCase):
         edits = [a for a in self.github.read()["log"] if a[:2] == ["repo", "edit"]]
         self.assertEqual(len(edits), 1)
 
+    def _release_made_but_unrecorded(self, **stub: object) -> Path:
+        """A publish whose release call made the release (with one asset) but reported a failure."""
+        asset = self.tmp / "release" / "tool.zip"
+        asset.write_bytes(b"made-up asset bytes 0001")
+        run = self.tmp / "run"
+        self.assertEqual(self.run_check("stage", "--out", str(run), *self.sources(), "--file", str(asset)).returncode, 0)
+        self.complete(run)
+        self.assertIn("SEAL=ok", self.run_check("seal", "--run", str(run)).stdout)
+        self.approve(run, "push")
+        self.assertEqual(self.run_check("push", "--run", str(run), *self.sources(), "--file", str(asset)).returncode, 0)
+        self.assertEqual(self.run_check("preflight", "--run", str(run), "--repo", REPO).returncode, 0)
+        self.assertEqual(self.approve(run, "publish", *self.release_args(), "--release-asset", str(asset)).returncode, 0)
+        self.github.update(lambda st: st.update({"release_fail_after_create": True, **stub}))
+        got = self.run_check("publish", "--run", str(run), "--repo", REPO)
+        self.assertIn("RELEASE=failed", got.stdout, got.stdout + got.stderr)
+        return run
+
+    def _resume(self, run: Path) -> subprocess.CompletedProcess[str]:
+        return self.run_check("publish", "--run", str(run), "--repo", REPO)
+
+    def test_a_release_found_on_resume_is_accepted_when_identical(self) -> None:
+        got = self._resume(self._release_made_but_unrecorded())
+        self.assertEqual(got.returncode, 0, got.stdout + got.stderr)
+        self.assertIn("RELEASE=ok v1.0.0 (found after an interrupted run, identical to the approved one)", got.stdout)
+
+    def test_a_release_found_on_resume_without_digests_is_downloaded_and_accepted(self) -> None:
+        got = self._resume(self._release_made_but_unrecorded(no_digest=True))
+        self.assertEqual(got.returncode, 0, got.stdout + got.stderr)
+        self.assertIn("RELEASE=ok v1.0.0 (found after an interrupted run", got.stdout)
+        self.assertTrue(any(a[:2] == ["release", "download"] for a in self.github.read()["log"]))
+
+    def test_a_same_size_asset_with_other_content_is_refused_on_resume(self) -> None:
+        run = self._release_made_but_unrecorded()
+
+        def swap(st: dict) -> None:  # GitHub records another digest for an asset of the same size
+            st["lists"]["releases"][0]["assets"][0]["digest"] = "sha256:" + "0" * 64
+        self.github.update(swap)
+        got = self._resume(run)
+        self.assertEqual(got.returncode, 1)
+        self.assertIn("its asset tool.zip is not the approved content (GitHub's digest differs)", got.stdout)
+
+    def test_a_same_size_asset_with_other_content_is_refused_without_a_digest(self) -> None:
+        run = self._release_made_but_unrecorded(no_digest=True)
+        (self.github.path.parent / "assets" / "v1.0.0" / "tool.zip").write_bytes(b"made-up asset bytes 0002")
+        got = self._resume(run)
+        self.assertEqual(got.returncode, 1)
+        self.assertIn("its asset tool.zip is not the approved content", got.stdout)
+
     def test_resume_when_the_switch_happened_but_was_not_recorded(self) -> None:
         run = self.pushed()
         self.run_check("preflight", "--run", str(run), "--repo", REPO)
@@ -552,7 +600,7 @@ class PublishCases(UploadCase):
         uploaded = self.github.read()["uploaded"]
         self.assertEqual([Path(u).name for u in uploaded], ["widgets.zip"])
         rel = self.github.read()["lists"]["releases"][0]
-        self.assertEqual(rel["assets"], [{"name": "widgets.zip", "size": 22}])
+        self.assertEqual([(a["name"], a["size"]) for a in rel["assets"]], [("widgets.zip", 22)])
 
     # ── the second review round's cases ──────────────────────────────────────
     def test_a_switch_that_reported_failure_is_checked_on_resume(self) -> None:

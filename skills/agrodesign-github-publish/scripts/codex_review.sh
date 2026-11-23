@@ -12,7 +12,7 @@
 # THE ORDER IS ENFORCED HERE. The brief must be a run's Codex brief, and before anything
 # is sent `github_upload_check.py gate --run <run> --before codex` must say GATE=open
 # (the staged tree intact, the scan, its triage and Claude's answers for this digest,
-# every hit and finding that needs it cleared), and the brief must hold the whole text
+# the values file checked and unchanged, every hit and finding that needs it cleared), and the brief must hold the whole text
 # of the indexed bundle-NN.md. Otherwise nothing is sent (exit 11).
 #
 # MODEL AND EFFORT are requested here, never inherited from ~/.codex/config.toml (which

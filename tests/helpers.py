@@ -133,14 +133,34 @@ if args[:2] == ["repo", "edit"]:
 if args[:2] == ["release", "create"]:
     if st.get("release_fail"):
         save(); sys.stderr.write("release failed\n"); sys.exit(1)
+    import hashlib, shutil
     tag = args[2]
     target = args[args.index("--target") + 1]
     st.setdefault("tag_refs", {}).setdefault(tag, target)
-    assets = [{"name": os.path.basename(a), "size": os.path.getsize(a)} for a in args[args.index("--latest") + 1:]]
-    st.setdefault("uploaded", []).extend(args[args.index("--latest") + 1:])
+    files = args[args.index("--latest") + 1:]
+    keep = os.path.join(here, "assets", tag)  # the stored copies `release download` serves
+    os.makedirs(keep, exist_ok=True)
+    assets = []
+    for a in files:
+        shutil.copyfile(a, os.path.join(keep, os.path.basename(a)))
+        row = {"name": os.path.basename(a), "size": os.path.getsize(a)}
+        if not st.get("no_digest"):
+            row["digest"] = "sha256:" + hashlib.sha256(open(a, "rb").read()).hexdigest()
+        assets.append(row)
+    st.setdefault("uploaded", []).extend(files)
     st.setdefault("lists", {}).setdefault("releases", []).append({
         "tag_name": tag, "draft": False, "prerelease": False, "html_url": "https://github.example/releases/" + tag,
         "name": args[args.index("--title") + 1], "body": open(args[args.index("--notes-file") + 1]).read(), "assets": assets})
+    if st.pop("release_fail_after_create", False):  # made, but the call reports a failure
+        save(); sys.stderr.write("timeout\n"); sys.exit(1)
+    out({})
+if args[:2] == ["release", "download"]:
+    import shutil
+    tag, pattern, dest = args[2], args[args.index("--pattern") + 1], args[args.index("--dir") + 1]
+    src = os.path.join(here, "assets", tag, pattern)
+    if not os.path.isfile(src):
+        save(); sys.stderr.write("no asset\n"); sys.exit(1)
+    shutil.copyfile(src, os.path.join(dest, pattern))
     out({})
 save(); sys.stderr.write("unknown gh command\n"); sys.exit(2)
 '''

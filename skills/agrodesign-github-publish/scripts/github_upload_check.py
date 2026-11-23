@@ -1645,11 +1645,21 @@ def cmd_bundle(run: Path, max_bytes: int) -> int:
 def gate_problems(run: Path, before: str) -> list[str]:
     """Why the set may not go to the next vendor yet: before Codex, stages 1-2 for this
     digest (the staged tree intact, the scan and its triage, Claude's answers) and
-    Claude's findings cleared; before Grok, stages 1-3 and Claude's and Codex's."""
+    Claude's findings cleared; before Grok, stages 1-3 and Claude's and Codex's. Both
+    gates also need the scan to have checked THE values file, unchanged since (as the seal
+    does): a set scanned without it could carry a private value to an outside provider."""
     manifest = checked_manifest(run)
     digest = str(manifest.get("digest"))
     upto = "claude" if before == "codex" else "codex"
-    return stage_problems(run, manifest, {}, upto=upto) + clearance_problems(run, digest, upto)
+    problems = stage_problems(run, manifest, {}, upto=upto) + clearance_problems(run, digest, upto)
+    try:
+        scan = json.loads((run / "scan" / "report.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        scan = {}
+    site = values_seal_problem(scan)
+    if site:
+        problems.append(site)
+    return problems
 
 
 def cmd_gate(run: Path, before: str) -> int:
@@ -2421,17 +2431,35 @@ def _norm_text(text: str) -> str:
     return text.replace("\r\n", "\n").strip()
 
 
-def release_mismatch(found: dict[str, Any], tag: str, title: str, notes: str, assets: list[Path]) -> str | None:
-    """Why a release GitHub shows is not exactly the approved one (None: it is)."""
+def release_mismatch(found: dict[str, Any], tag: str, title: str, notes: str, assets: list[Path], repo: str) -> str | None:
+    """Why a release GitHub shows is not exactly the approved one (None: it is). Each
+    asset's content is compared too: by the SHA-256 GitHub records for it (its `digest`),
+    or, where GitHub gives none, by downloading it — a same-size replacement is caught."""
     if found.get("tag_name") != tag or found.get("draft") or found.get("prerelease"):
         return f"tag {found.get('tag_name')}, draft {found.get('draft')}, pre-release {found.get('prerelease')}"
     if _norm_text(str(found.get("name") or "")) != _norm_text(title):
         return "its title is not the approved one"
     if _norm_text(str(found.get("body") or "")) != _norm_text(notes):
         return "its notes are not the approved ones"
-    got = sorted((str(a.get("name")), int(a.get("size") or 0)) for a in found.get("assets") or [] if isinstance(a, dict))
+    listed = [a for a in found.get("assets") or [] if isinstance(a, dict)]
+    got = sorted((str(a.get("name")), int(a.get("size") or 0)) for a in listed)
     if got != sorted((a.name, a.stat().st_size) for a in assets):
         return f"its assets {got} are not the approved ones"
+    approved = {a.name: sha256_file(a) for a in assets}
+    for a in listed:
+        asset_name = str(a.get("name"))
+        digest = str(a.get("digest") or "")
+        if digest.startswith("sha256:"):
+            if digest.split(":", 1)[1].lower() != approved[asset_name]:
+                return f"its asset {asset_name} is not the approved content (GitHub's digest differs)"
+            continue
+        with tempfile.TemporaryDirectory(prefix="agrodesign-github-publish-check-") as tmp:
+            proc = gh("release", "download", tag, "--repo", repo, "--pattern", asset_name, "--dir", tmp)
+            got_file = Path(tmp) / asset_name
+            if proc.returncode != 0 or not got_file.is_file():
+                return f"its asset {asset_name} could not be downloaded to check its content: {safe((proc.stderr or proc.stdout).strip()[-200:])}"
+            if sha256_file(got_file) != approved[asset_name]:
+                return f"its asset {asset_name} is not the approved content"
     return None
 
 
@@ -2465,7 +2493,7 @@ def do_release(run: Path, name: str, spec: dict[str, Any], recheck: Callable[[],
             print(f"RELEASE=refused: a draft release for {tag} exists (an interrupted asset upload?) — delete it on GitHub, then run publish again")
             return 1
         if same_tag:
-            bad = release_mismatch(same_tag[0], tag, title, notes, uploads)
+            bad = release_mismatch(same_tag[0], tag, title, notes, uploads, name)
             if mine and not bad and pointed == target:
                 save_state(run, released={"at": _now().isoformat(timespec="seconds"), "tag": tag, "target": target, "url": same_tag[0].get("html_url")})
                 print(f"RELEASE=ok {tag} (found after an interrupted run, identical to the approved one)")
@@ -2489,7 +2517,7 @@ def do_release(run: Path, name: str, spec: dict[str, Any], recheck: Callable[[],
         except GhError as exc:
             print(f"RELEASE=unconfirmed: {exc} — run state to see what GitHub holds")
             return 1
-        bad = release_mismatch(made, tag, title, notes, uploads) if isinstance(made, dict) else "unreadable"
+        bad = release_mismatch(made, tag, title, notes, uploads, name) if isinstance(made, dict) else "unreadable"
     if bad or pointed != target or not isinstance(made, dict):
         print(f"RELEASE=wrong: GitHub shows tag {tag} at {str(pointed)[:12]} ({bad}) — check it by hand")
         return 1

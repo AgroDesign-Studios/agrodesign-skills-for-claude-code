@@ -199,6 +199,20 @@ class GateAndSealCases(UploadCase):
         self.assertEqual(got.returncode, 0, got.stdout)
         self.assertIn("GATE=open before codex", got.stdout)
 
+    def test_gates_check_the_values_as_the_seal_does(self) -> None:
+        run = self.staged(self.make_tree({"a.txt": "fine\n"}))
+        self.through_claude(run)
+        self.bind(run, self.resolved)
+        self.assertIn("GATE=open before codex", self.run_check("gate", "--run", str(run), "--before", "codex").stdout)
+        self.write_values({"host.build": FAKE_HOST, "account.ci": FAKE_ACCOUNT, "host.new": "new-" + FAKE_HOST})
+        for before in ("codex", "grok"):
+            got = self.run_check("gate", "--run", str(run), "--before", before)
+            self.assertEqual(got.returncode, 1)
+            self.assertIn(f"GATE=closed before {before}: private values changed since the scan", got.stdout)
+        self.values_path.unlink()
+        got = self.run_check("gate", "--run", str(run), "--before", "codex")
+        self.assertIn("the values file cannot be read now", got.stdout)
+
     def test_gate_refuses_an_answer_that_names_too_few_files(self) -> None:
         run = self.staged(self.make_tree({"a.txt": "one\n", "b.txt": "two\n"}))
         self.through_claude(run)
