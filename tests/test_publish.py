@@ -191,12 +191,12 @@ class PublishCases(UploadCase):
 
     def test_preflight_refuses_content_nobody_checked(self) -> None:
         run = self.pushed()
-        self.github.update(lambda st: st["lists"].update({"issues": [{"number": 1}], "labels": [{"name": "bug"}, {"name": "zeta-internal"}]}))
+        self.github.update(lambda st: st["lists"].update({"issues": [{"number": 1}], "labels": [{"name": "bug", "description": "zeta cluster outage"}, {"name": "zeta-internal"}]}))
         self.github.update(lambda st: st["repos"][REPO].update({"has_wiki": True}))
         got = self.run_check("preflight", "--run", str(run), "--repo", REPO)
         self.assertEqual(got.returncode, 1)
         self.assertIn("issues_and_pull_requests: 1", got.stdout)
-        self.assertIn("labels beyond GitHub's defaults", got.stdout)
+        self.assertIn("labels beyond GitHub's defaults (or with edited descriptions) were never checked: bug, zeta-internal", got.stdout)
         self.assertIn("the wiki is on", got.stdout)
 
     def test_preflight_refuses_a_read_that_failed(self) -> None:
@@ -680,7 +680,7 @@ class PublishCases(UploadCase):
         self.assertIn("1 status(es) and 1 check run(s)", got.stdout)
         self.assertIn("activity log covers 90 days", got.stdout)
 
-    # ── from the in-house copy's list ────────────────────────────────────────
+    # ── further cases ────────────────────────────────────────────────────────
     def test_an_approval_replaced_mid_run_stops_the_switch(self) -> None:
         run = self.ready_to_publish(*self.release_args())
         path = str(run / "approvals" / "publish.json")
@@ -720,6 +720,32 @@ class PublishCases(UploadCase):
         got = self.approve(run, "publish", *self.release_args(), "--release-asset", str(one), "--release-asset", str(two))
         self.assertEqual(got.returncode, 2)
         self.assertIn("without case", got.stderr)
+
+    def test_statuses_on_an_earlier_commit_are_refused(self) -> None:
+        (self.clone / "more.txt").write_text("more\n")
+        git(self.clone, "add", "-A")
+        git(self.clone, "commit", "-q", "-m", "Second")
+        first = self.tip
+        self.tip = git(self.clone, "rev-parse", "HEAD")
+        run = self.pushed()
+        st_path = self.github.path
+
+        def only_first(st: dict) -> None:  # statuses on the older commit only
+            st["status_commit"] = first
+            st["lists"]["statuses"] = [{"state": "success"}]
+        self.github.update(only_first)
+        got = self.run_check("preflight", "--run", str(run), "--repo", REPO)
+        self.assertEqual(got.returncode, 1, st_path)
+        self.assertIn(f"{first[:12]} carries 1 status(es)", got.stdout)
+        self.assertNotIn(f"{self.tip[:12]} carries", got.stdout)
+
+    def test_a_release_that_appears_during_the_switch_switches_back(self) -> None:
+        run = self.ready_to_publish(*self.release_args())
+        self.github.update(lambda st: st.update({"edit_adds_release": True}))
+        got = self.publish(run)
+        self.assertEqual(got.returncode, 1)
+        self.assertIn("PUBLISH=reverted", got.stdout)
+        self.assertEqual(self.visibility(), "private")
 
     def test_url_spellings_are_one_repository(self) -> None:
         import importlib.util

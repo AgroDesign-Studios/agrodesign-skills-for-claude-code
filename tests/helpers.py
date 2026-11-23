@@ -93,6 +93,8 @@ if args[:1] == ["api"]:
         out({"url": "x"}) if st.get("pages") else fail(404, "Not Found")
     t = re.match(r"^commits/([0-9a-f]+)/(statuses|check-runs)$", rest)
     if t:
+        if st.get("status_commit") and t.group(1) != st["status_commit"]:  # statuses on one commit only
+            out({"total_count": 0}) if t.group(2) == "check-runs" else out([])
         if t.group(2) == "check-runs":
             out({"total_count": st.get("totals", {}).get("check-runs", 0)})
         items = st.get("lists", {}).get("statuses", [])
@@ -123,6 +125,8 @@ if args[:2] == ["repo", "edit"]:
         st["repos"][name]["visibility"] = vis
         if vis == "public" and st.get("edit_adds_issue"):  # something arrives during the switch
             st.setdefault("lists", {}).setdefault("issues", []).append({"number": 99})
+        if vis == "public" and st.get("edit_adds_release"):  # a release on an existing tag, during the switch
+            st.setdefault("lists", {}).setdefault("releases", []).append({"tag_name": "v0.0.1", "draft": False, "prerelease": False, "name": "x", "body": "x", "assets": []})
         if vis == "public" and st.pop("edit_fail_after_switch", False):  # switched, but the call reports a failure
             save(); sys.stderr.write("timeout\n"); sys.exit(1)
     out({})
@@ -158,7 +162,7 @@ class FakeGitHub:
         folder.mkdir(parents=True, exist_ok=True)
         self.gh = executable(folder / "gh", GH_STUB)
         self.path = folder / "github.json"
-        self.write({"repos": {}, "lists": {"labels": [{"name": "bug"}, {"name": "question"}]}, "totals": {}})
+        self.write({"repos": {}, "lists": {"labels": [{"name": "bug", "description": "Something isn't working"}, {"name": "question", "description": "Further information is requested"}]}, "totals": {}})
         import http.server
         import threading
 

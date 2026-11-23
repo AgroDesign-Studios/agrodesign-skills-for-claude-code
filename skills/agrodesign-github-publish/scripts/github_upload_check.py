@@ -141,8 +141,16 @@ FULL_SHA = re.compile(r"[0-9a-f]{40}")
 ASSET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}")
 #: Seconds between the reads right after a switch (GitHub can lag a moment); tests shorten it.
 RETRY_SECONDS = float(os.environ.get("AGRODESIGN_GITHUB_PUBLISH_RETRY_SECONDS", "3"))
-#: Labels every new GitHub repository starts with; any other label is text nobody checked.
-DEFAULT_LABELS = frozenset({"bug", "documentation", "duplicate", "enhancement", "good first issue", "help wanted", "invalid", "question", "wontfix"})
+#: Labels every new GitHub repository starts with, and their descriptions; any other label,
+#: or a default one whose description was edited, is text nobody checked.
+DEFAULT_LABELS = {
+    "bug": "Something isn't working", "documentation": "Improvements or additions to documentation",
+    "duplicate": "This issue or pull request already exists", "enhancement": "New feature or request",
+    "good first issue": "Good for newcomers", "help wanted": "Extra attention is needed",
+    "invalid": "This doesn't seem right", "question": "Further information is requested", "wontfix": "This will not be worked on",
+}
+#: Commit statuses and check runs are read for every checked commit, up to this many.
+MAX_STATUS_COMMITS = 1000
 PAGE_SIZE = 100
 #: GitHub keeps a repository's activity log (ref changes) for this many days.
 ACTIVITY_DAYS = 90
@@ -2215,22 +2223,26 @@ def preflight_check(run: Path, name: str, *, after_switch: bool = False) -> tupl
             problems.append("a custom social preview image was uploaded: never checked — remove it first")
     except GhError as exc:
         problems.append(f"could not read packages and the social preview image: {exc}")
-    for p in pushes:  # statuses and check runs on the checked commits become public too
-        commit = str(p.get("commit") or p["tip"])
+    # Statuses and check runs on any checked commit become public with the history.
+    checked = sorted(str(e["origin"]).split(":", 2)[2] for e in manifest["entries"] if str(e.get("origin", "")).startswith("git:commit:"))  # type: ignore[union-attr]
+    if len(checked) > MAX_STATUS_COMMITS:
+        problems.append(f"{len(checked)} commits: more than {MAX_STATUS_COMMITS} to read statuses and check runs for — out of scope")
+        checked = []
+    carrying = []
+    for commit in checked:
         try:
             statuses = len(gh_list(f"repos/{name}/commits/{commit}/statuses"))
             checks = gh_total(f"repos/{name}/commits/{commit}/check-runs")
         except GhError as exc:
             problems.append(f"could not read the statuses or check runs of {commit[:12]}: {exc}")
-            continue
-        inv[f"statuses_{commit[:12]}"] = [statuses, checks]
+            break
         if statuses or checks:
+            carrying.append(commit)
             problems.append(f"{commit[:12]} carries {statuses} status(es) and {checks} check run(s) that were never checked")
+    inv["commits_with_statuses"] = carrying
     lists = {"issues_and_pull_requests": "issues?state=all", "pull_requests": "pulls?state=all", "commit_comments": "comments",
              "releases": "releases", "milestones": "milestones?state=all", "deployments": "deployments", "forks": "forks"}  # fmt: skip
     for label, path in lists.items():
-        if after_switch and label == "releases":
-            continue  # the approved release may follow the switch; it is compared on its own
         try:
             inv[label] = len(gh_list(f"repos/{name}/{path}"))
         except GhError as exc:
@@ -2256,11 +2268,11 @@ def preflight_check(run: Path, name: str, *, after_switch: bool = False) -> tupl
         if inv[label]:
             problems.append(f"{label}: {inv[label]} — Actions history, logs and artefacts become public too")
     try:
-        labels = sorted(str(x.get("name")) for x in gh_list(f"repos/{name}/labels") if isinstance(x, dict))
-        inv["labels"] = labels
-        extra = [x for x in labels if x not in DEFAULT_LABELS]
+        found = [(str(x.get("name")), str(x.get("description") or "")) for x in gh_list(f"repos/{name}/labels") if isinstance(x, dict)]
+        inv["labels"] = sorted(n for n, _ in found)
+        extra = [n for n, d in found if DEFAULT_LABELS.get(n) != d]
         if extra:
-            problems.append(f"labels beyond GitHub's defaults were never checked: {', '.join(extra)[:200]}")
+            problems.append(f"labels beyond GitHub's defaults (or with edited descriptions) were never checked: {', '.join(sorted(extra))[:200]}")
     except GhError as exc:
         problems.append(f"could not read labels: {exc}")
     try:
@@ -2326,8 +2338,8 @@ def inventory_match(inv: dict[str, Any], digest: str) -> str:
 
 
 def inventory_core(inv: dict[str, Any]) -> dict[str, Any]:
-    """The inventory without what the switch itself changes (visibility) or may add (the release)."""
-    core = {k: v for k, v in inv.items() if k not in ("releases",)}
+    """The inventory without what the switch itself changes (the visibility)."""
+    core = dict(inv)  # a release that appeared before this run's own is a change too
     core["repo"] = {k: v for k, v in (inv.get("repo") or {}).items() if k not in ("private", "visibility")}
     core["features"] = {k: v for k, v in (inv.get("features") or {}).items()}
     return core
