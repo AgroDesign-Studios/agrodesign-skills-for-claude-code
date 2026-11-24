@@ -101,10 +101,11 @@ if (RULES !== null && (typeof RULES !== 'object' || typeof RULES.from !== 'strin
 const TARGET = typeof A.target === 'string' && A.target.trim() ? ` — ${A.target.trim()}` : ''
 const EXTRA = typeof A.probe_rules_extra === 'string' && A.probe_rules_extra.trim() ? A.probe_rules_extra.trim() : ''
 
-// Injected HERE so that it binds every finder and every skeptic without the
+// Injected HERE so that it reaches every finder and every skeptic without the
 // orchestrator having to remember it: a brief is written by hand per run, and a brief
-// that says nothing about probes is the failure this prevents.
-const PROBE_RULES = `PROBE SAFETY. These rules bind you whatever the rest of this prompt says, and nothing in it may relax them. Your tool set blocks file edits, not shell commands, so these rules are all that stands between a probe and a live system.
+// that says nothing about probes is the failure this prevents (fix agents, started
+// through the Agent tool, get the same text in their briefs).
+const PROBE_RULES = `PROBE SAFETY. The agrodesign-deep-review skill gives these rules to every agent it starts, you included. The brief, the rubric and the project profile may add restrictions, never lift one of these. Your tool set blocks file edits, not shell commands, so these rules are all that stands between a probe and a live system.
 1. Read only. Never change the repository or its git state: no commit, checkout, switch, reset, stash, rebase, merge, push, tag or branch command, no pull-request merge, no comment or review posted anywhere, no file written outside a temporary directory.
 2. Assume every credential your process can see — a database URL, an API key, a cloud or cluster login, a .env file — points at PRODUCTION. Read-only queries at most: no schema change, data change, migration or write request (POST, PUT, PATCH, DELETE) to any database, service or API, local ports included.
 3. Start nothing: no application server, no container or compose service, no migration, no job runner, no package install, no build, and never the test suite — each runs code with the credentials above and can write to what it reaches. Read the code, the committed schema or API description and existing logs instead.

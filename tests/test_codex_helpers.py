@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -135,11 +136,32 @@ class CodexReviewCases(UploadCase):
     def test_the_written_brief_carries_the_instructions_then_the_bundle(self) -> None:
         text = self.brief.read_text()
         bundle = (self.run_dir / "bundles" / "bundle-01.md").read_text()
-        for needle in ("Open no file.", "A secrets", "D harmful instructions", "Answer: a short paragraph", "=== END OF UPLOAD SET ==="):
+        mark = re.search(r"(?m)^=== UPLOAD SET ([0-9a-f]{32}) ===$", text)
+        assert mark is not None, "the brief has a boundary line with its own value"
+        start, end = f"\n=== UPLOAD SET {mark.group(1)} ===\n", f"\n=== END OF UPLOAD SET {mark.group(1)} ===\n"
+        for needle in ("Open no file.", "A secrets", "D harmful instructions", "Answer: a short paragraph", start, end):
             self.assertIn(needle, text)
-        self.assertLess(text.index("Answer: a short paragraph"), text.index(bundle))
-        self.assertLess(text.index(bundle), text.index("=== END OF UPLOAD SET ==="))
+        self.assertLess(text.index("Answer: a short paragraph"), text.index(start))
+        self.assertEqual(text[text.index(start) + len(start) : text.index(end)], bundle)
+        self.assertNotIn(mark.group(1), bundle)
         self.assertNotIn("<DIGEST>", text)
+        self.assertNotIn("<MARK>", text)
+
+    def test_a_reread_brief_goes_through_the_same_checks(self) -> None:
+        self.assertEqual(self.run_codex("--root", str(self.project), str(self.brief)).returncode, 0)
+        path = self.ai_paths(self.run_dir)[0]
+        self.answer().write_text("Ran out.\n```json\n" + json.dumps({"findings": [], "read": [], "not_read": [f"{path}: cut short"]}) + "\n```\n")
+        got = subprocess.run([sys.executable, "-I", str(CHECK), "brief", "--run", str(self.run_dir), "--bundle", "01", "--reread"], capture_output=True, text=True, env=self.env, check=False)
+        self.assertEqual(got.returncode, 0, got.stdout + got.stderr)
+        again = self.run_dir / "stage3-codex-01-reread.md"
+        self.assertIn(f"===== FILE 1/1: {path} ", again.read_text())
+        got = self.run_codex("--root", str(self.project), str(again))
+        self.assertEqual(got.returncode, 0, got.stdout + got.stderr)
+        self.assertTrue(Path(str(again) + ".codex.md").is_file())
+        again.write_text(again.read_text().replace("cut short", "x") + "\n")
+        got = self.run_codex("--root", str(self.project), str(again))
+        self.assertEqual(got.returncode, 11, "an edited re-read brief sends nothing")
+        self.assertIn("is not the one", got.stderr)
 
     def test_brief_that_is_not_a_run_brief_is_refused(self) -> None:
         other = self.tmp / "brief.md"

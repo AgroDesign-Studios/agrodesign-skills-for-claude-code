@@ -2,10 +2,11 @@
 # codex_review.sh — one read-only Codex read of a brief, answered into a file
 # (the agrodesign-github-publish skill, Step 3).
 #
-#   bash codex_review.sh [--root DIR]... [--deny PATH]... <run>/stage3-codex-NN.md
+#   bash codex_review.sh [--root DIR]... [--deny PATH]... <run>/stage3-codex-NN[-reread].md
 #
 # Runs `codex exec` once, from a fresh empty folder, with the brief on stdin, and
-# writes Codex's final answer to <run>/stage3-codex-NN.md.codex.md. The event stream
+# writes Codex's final answer to <brief>.codex.md (<run>/stage3-codex-NN.md.codex.md;
+# a re-read of the files that answer did not read: -reread.md.codex.md). The event stream
 # goes to <answer>.log and the containment report to <answer>.contain. The brief carries
 # everything Codex is to read; it is told to open no file.
 #
@@ -13,9 +14,10 @@
 # is sent `github_upload_check.py gate --run <run> --before codex` must say GATE=open
 # (the staged tree intact, the scan, its triage and Claude's answers for this digest,
 # the values file checked and unchanged, every hit and finding that needs it cleared), and
-# the brief must be exactly what `github_upload_check.py brief --run <run> --bundle NN`
-# writes (reference/briefs.md § Stage 3 with the digest and the indexed bundle-NN.md's
-# whole text). Otherwise nothing is sent (exit 11).
+# the brief must be exactly what `github_upload_check.py brief --run <run> --bundle NN
+# [--reread]` writes (reference/briefs.md § Stage 3 with the digest, its own random
+# boundary value and the indexed bundle-NN.md's whole text, or for a re-read the files
+# the first answer did not read). Otherwise nothing is sent (exit 11).
 #
 # MODEL AND EFFORT are requested here, never inherited from ~/.codex/config.toml (which
 # is per account and can drift): CODEX_REVIEW_MODEL (default gpt-6-astra, the strongest
@@ -48,7 +50,7 @@
 # CODEX_REVIEW_TIMEOUT: seconds, 1..7200 (default 900; the skill uses 2400 per bundle).
 #
 # Exit: 0 answer written by the requested model; 2 usage (also a timeout outside
-# 1..7200 s, or a brief that is not <run>/stage3-codex-NN.md); 3 codex, timeout, python3, the
+# 1..7200 s, or a brief that is not <run>/stage3-codex-NN[-reread].md); 3 codex, timeout, python3, the
 # containment helper or the read-deny helper missing, or the deny table could not be
 # built (nothing sent); 4 codex failed, timed out or was killed; 5 codex exited 0 but
 # wrote no answer; 6 the served model was not the requested one (or could not be read);
@@ -79,17 +81,19 @@ done
 
 PROMPT="${1:-}"
 if [ -z "$PROMPT" ] || [ ! -r "$PROMPT" ] || [ "$#" -ne 1 ]; then
-  echo "usage: codex_review.sh [--root DIR]... [--deny PATH]... <run>/stage3-codex-NN.md" >&2
+  echo "usage: codex_review.sh [--root DIR]... [--deny PATH]... <run>/stage3-codex-NN[-reread].md" >&2
   exit 2
 fi
 case "$PROMPT" in /*) ;; *) PROMPT="$PWD/$PROMPT" ;; esac
 NAME="$(basename -- "$PROMPT")"
 RUN="$(cd "$(dirname -- "$PROMPT")" && pwd)"
+REREAD=()
 case "$NAME" in
+  stage3-codex-[0-9]*-reread.md) NN="${NAME#stage3-codex-}"; NN="${NN%-reread.md}"; REREAD=( --reread ) ;;
   stage3-codex-[0-9]*.md) NN="${NAME#stage3-codex-}"; NN="${NN%.md}" ;;
-  *) echo "codex_review.sh: the brief must be a run's <run>/stage3-codex-NN.md (SKILL.md Step 3)" >&2; exit 2 ;;
+  *) echo "codex_review.sh: the brief must be a run's <run>/stage3-codex-NN[-reread].md (SKILL.md Step 3)" >&2; exit 2 ;;
 esac
-case "$NN" in ''|*[!0-9]*) echo "codex_review.sh: the brief must be a run's <run>/stage3-codex-NN.md" >&2; exit 2 ;; esac
+case "$NN" in ''|*[!0-9]*) echo "codex_review.sh: the brief must be a run's <run>/stage3-codex-NN[-reread].md" >&2; exit 2 ;; esac
 OUT="$PROMPT.codex.md"
 # A previous run's files go now, so a re-run that fails never leaves an old answer
 # next to the new brief.
@@ -154,11 +158,12 @@ if [ -n "$BRIEF_HIT" ]; then
   echo "$MARK=secret hit=$BRIEF_HIT — the brief scan found what looks like a secret, or could not run; nothing was sent" >&2
   exit 9
 fi
-# The brief must be exactly the one `github_upload_check.py brief` writes for this bundle:
-# the instructions (lenses, rules, answer form), the digest, the indexed bundle's whole
-# text and the closing — a hand-made brief that lost the instructions is refused.
-if ! "$PY" -I "$CHECK" brief --run "$RUN" --bundle "$NN" --check "$PROMPT" >/dev/null 2>&1; then
-  echo "$MARK=out-of-order — the brief is not the one \`github_upload_check.py brief --run <run> --bundle $NN\` writes (instructions, digest and the indexed bundle's whole text); nothing was sent" >&2
+# The brief must be exactly one `github_upload_check.py brief` writes for this bundle:
+# the instructions (lenses, rules, answer form), the digest, a boundary value absent from
+# the set, the indexed bundle's whole text (or, for a re-read, the files the first answer
+# did not read) and the closing — a hand-made brief that lost the instructions is refused.
+if ! "$PY" -I "$CHECK" brief --run "$RUN" --bundle "$NN" "${REREAD[@]}" --check "$PROMPT" >/dev/null 2>&1; then
+  echo "$MARK=out-of-order — the brief is not the one \`github_upload_check.py brief --run <run> --bundle $NN ${REREAD[*]}\` writes (instructions, digest, its own boundary value and the indexed bundle's text); nothing was sent" >&2
   exit 11
 fi
 

@@ -62,6 +62,9 @@ class EngineCases(unittest.TestCase):
             self.assertIn(field, find["required"])
         self.assertEqual(find["promptHead"], "PROBE SAFETY. ")
         self.assertTrue(find["hasHead"])
+        # The rules name whom they are for and claim no authority over the rest of the prompt.
+        self.assertNotIn("whatever the rest of this prompt says", src)
+        self.assertIn("skill gives these rules to every agent it starts", src)
 
     def test_rows_without_a_tier_or_commit_are_rejected(self) -> None:
         for args, msg in (

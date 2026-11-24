@@ -7,7 +7,7 @@ agrodesign-github-publish skill).
   stage     --out RUN SOURCE...
   scan      --run RUN [--values-file FILE]
   bundle    --run RUN [--max-bytes N]
-  brief     --run RUN --bundle NN [--check FILE]
+  brief     --run RUN --bundle NN [--reread] [--check FILE]
   gate      --run RUN --before codex|grok
   seal      --run RUN
   verify    --run RUN SOURCE...
@@ -95,6 +95,7 @@ import json
 import lzma
 import os
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -121,8 +122,17 @@ except ImportError:
 #: A text file larger than this is scanned mechanically only (no AI reads it):
 #: built artefacts such as a 19 MB release page. The final check names them.
 AI_MAX_BYTES = 800_000
-#: One bundle: about 250k tokens of code, half of grok-4.7's 500k window.
-BUNDLE_MAX_BYTES = 900_000
+#: One bundle (the `bundle --max-bytes` default; never raise it). Bundles of about 0.9 MB
+#: came back from Codex marked ok with the middle of the input left out (18, 43 and about
+#: 57 files `not_read` in three of them), so a bundle stays under 350 KB; one file larger
+#: than this makes its bundle larger (a BUNDLE_OVERSIZE line names it).
+BUNDLE_MAX_BYTES = 350_000
+#: Stage 2: one Claude agent reads the whole set only up to this many text files and bytes;
+#: above either, one agent per bundle (`stage2-claude-NN.json`), and the gates refuse a
+#: whole-set answer. A split by lens would still have every agent read everything: what
+#: fails on a large set is reading it to the end.
+STAGE2_WHOLE_MAX_FILES = 150
+STAGE2_WHOLE_MAX_BYTES = 2_000_000
 #: Archive members read for the scan (larger ones are named for the session).
 MEMBER_MAX_BYTES = 5_000_000
 #: One archive's members, read one at a time: past this many bytes in all, or this many
@@ -835,26 +845,34 @@ def stage_problems(run: Path, manifest: dict[str, object], stages: dict[str, obj
         problems.append("mechanical: no scan report for this digest")
     elif scan.get("hits") and not (run / "triage.md").is_file():
         problems.append("mechanical: the scan had hits and there is no triage.md")
-    entries = manifest.get("entries")
-    ai_files = [str(e.get("path")) for e in entries if isinstance(e, dict) and e.get("ai")] if isinstance(entries, list) else []
-    if not waived("claude"):
-        answers = sorted(run.glob("stage2-claude*.json"))
-        if not answers:
-            problems.append("claude: no stage2-claude*.json")
-        for a in answers:
-            got = _json_file(a)
-            if not isinstance(got, dict) or not isinstance(got.get("findings"), list) or got.get("digest") != digest:
-                problems.append(f"claude: {a.name} is not {{digest, findings: [...]}} for this digest")
-            elif CLAUDE_STAGE_MODEL not in str(got.get("ran_on", "")).lower():
-                problems.append(f"claude: {a.name} has no ran_on naming {CLAUDE_STAGE_MODEL.capitalize()} (the model the agent's system prompt named)")
-            else:
-                problems += [f"claude: {p}" for p in answer_shape_problems(a.name, got, ai_files)]
     index = _json_file(run / "bundles" / "index.json")
     listed = index.get("bundles") if isinstance(index, dict) and index.get("digest") == digest else None
     on_disk = {b.name for b in (run / "bundles").glob("bundle-*.md")}
     if not isinstance(listed, dict) or not listed or set(listed) != on_disk:
         problems.append("bundles: bundles/index.json missing, for another digest, or not the bundles on disk")
         listed = {}
+    if not waived("claude"):
+        parts, why = stage2_parts(run, manifest)
+        answers = sorted(run.glob("stage2-claude*.json"))
+        if parts is None:
+            problems.append(f"claude: {why}")
+        elif not answers:
+            problems.append("claude: no stage2-claude*.json")
+        for a in answers if parts is not None else []:
+            got = _json_file(a)
+            if a.name not in parts:
+                problems.append(f"claude: {a.name} is not an answer this set takes ({why})")
+            elif not isinstance(got, dict) or not isinstance(got.get("findings"), list) or got.get("digest") != digest:
+                problems.append(f"claude: {a.name} is not {{digest, findings: [...]}} for this digest")
+            elif CLAUDE_STAGE_MODEL not in str(got.get("ran_on", "")).lower():
+                problems.append(f"claude: {a.name} has no ran_on naming {CLAUDE_STAGE_MODEL.capitalize()} (the model the agent's system prompt named)")
+            else:
+                problems += [f"claude: {p}" for p in answer_shape_problems(a.name, got, parts[a.name])]
+        names = {a.name for a in answers}
+        if parts is not None and answers and STAGE2_WHOLE not in names:
+            missing = [n for n in parts if n != STAGE2_WHOLE and n not in names]
+            if missing:
+                problems.append(f"claude: no answer for {len(missing)} bundle(s) (first: {missing[0]}) — one agent per bundle, every bundle")
     if upto == "claude":
         return problems
     if not waived("codex"):
@@ -881,31 +899,146 @@ def stage_problems(run: Path, manifest: dict[str, object], stages: dict[str, obj
     return problems
 
 
-#: The Stage 3 brief template, and the line in it the bundle's text takes the place of.
+#: The Stage 3 brief template, the line in it the bundle's text takes the place of, and
+#: the placeholder of the brief's own boundary value. Each brief gets a random value, so
+#: the template's boundary lines — which a set holding this skill carries in its own
+#: copy of briefs.md — can never be taken for the brief's end of the set.
 BRIEFS_MD = Path(__file__).resolve().parent.parent / "reference" / "briefs.md"
 BRIEF_SLOT = "<the whole text of bundle-NN.md follows here>\n"
+BRIEF_MARK = "<MARK>"
+BRIEF_MARK_RE = re.compile(r"^=== UPLOAD SET ([0-9a-f]{32}) ===$", re.M)
+#: The one Stage 2 answer that covers the whole set (else one per bundle, stage2-claude-NN.json).
+STAGE2_WHOLE = "stage2-claude.json"
 
 
-def codex_brief(run: Path, nn: str) -> str:
-    """The Codex brief for bundle NN, as `brief` writes it: reference/briefs.md § Stage 3
-    with the digest filled in and the bundle's whole text in its slot — the instructions
-    first, then the set, then the closing reminder."""
+def bundle_lists(run: Path, manifest: dict[str, object]) -> tuple[dict[str, list[str]] | None, str]:
+    """bundles/index.json's file list per bundle, in bundle-number order — (lists, "") or
+    (None, why). The lists are the script's own, but checked, not trusted: one per bundle
+    the index hashes (stage_problems holds those to the files on disk), numbered 1..n — a
+    list for a bundle that does not exist would take its files out of every AI stage while
+    the lists still add up — and together, in order, the manifest's AI-readable files."""
+    index = _json_file(run / "bundles" / "index.json")
+    lists = index.get("files") if isinstance(index, dict) else None
+    bundles = index.get("bundles") if isinstance(index, dict) else None
+    entries = manifest.get("entries")
+    ai = [str(e.get("path")) for e in entries if isinstance(e, dict) and e.get("ai")] if isinstance(entries, list) else None
+    if not isinstance(lists, dict) or not isinstance(bundles, dict) or ai is None:
+        return None, "bundles/index.json lists no files per bundle (bundle again)"
+    names = sorted(lists, key=_bundle_number)
+    if set(bundles) != set(lists) or [_bundle_number(n) for n in names] != list(range(1, len(names) + 1)):
+        return None, "bundles/index.json's file lists are not one per bundle, numbered from 1 (bundle again)"
+    if not all(isinstance(lists[n], list) and all(isinstance(f, str) for f in lists[n]) for n in names) or [f for n in names for f in lists[n]] != ai:
+        return None, "bundles/index.json's file lists are not the manifest's AI-readable files (bundle again)"
+    return {n: list(lists[n]) for n in names}, ""
+
+
+def stage2_parts(run: Path, manifest: dict[str, object]) -> tuple[dict[str, list[str]] | None, str]:
+    """The Stage 2 answers this set takes, each with the files it must name: one answer
+    per bundle (stage2-claude-NN.json: bundle NN's files) always, and the whole-set answer
+    (stage2-claude.json: every AI-readable file) only for a set of at most
+    STAGE2_WHOLE_MAX_FILES files and STAGE2_WHOLE_MAX_BYTES bytes — what one agent reads
+    to the end. (parts, the rule in words) or (None, why)."""
+    lists, why = bundle_lists(run, manifest)
+    if lists is None:
+        return None, why
+    entries = manifest.get("entries")
+    ai = [e for e in entries if isinstance(e, dict) and e.get("ai")] if isinstance(entries, list) else []
+    size = sum(int(e.get("size") or 0) for e in ai)
+    parts = {f"stage2-claude-{n.removeprefix('bundle-').removesuffix('.md')}.json": files for n, files in lists.items()}
+    if len(ai) <= STAGE2_WHOLE_MAX_FILES and size <= STAGE2_WHOLE_MAX_BYTES:
+        parts[STAGE2_WHOLE] = [str(e.get("path")) for e in ai]
+        return parts, f"{STAGE2_WHOLE} for the whole set, or one stage2-claude-NN.json per bundle"
+    return parts, (
+        f"{len(ai)} text files, {size:,} bytes: above one agent's share ({STAGE2_WHOLE_MAX_FILES} files, "
+        f"{STAGE2_WHOLE_MAX_BYTES:,} bytes), so one stage2-claude-NN.json per bundle, never {STAGE2_WHOLE}"
+    )
+
+
+def _brief_template() -> tuple[str, str]:
+    """reference/briefs.md § Stage 3's template, split at the bundle slot: (head, tail)."""
     try:
         doc = BRIEFS_MD.read_text(encoding="utf-8")
         section = doc[doc.index("## Stage 3"):doc.index("## Stage 4")]
     except (OSError, ValueError):
         die(f"{BRIEFS_MD}: missing, or without its Stage 3 and Stage 4 sections (reinstall the skill)", 3)
     m = re.search(r"^```text\n(.*?)^```$", section, re.S | re.M)
-    if not m or m.group(1).count(BRIEF_SLOT) != 1:
-        die(f"{BRIEFS_MD}: the Stage 3 template has no single bundle slot (reinstall the skill)", 3)
+    if not m or m.group(1).count(BRIEF_SLOT) != 1 or f"\n=== UPLOAD SET {BRIEF_MARK} ===\n" not in m.group(1):
+        die(f"{BRIEFS_MD}: the Stage 3 template has no single bundle slot or no {BRIEF_MARK} boundary line (reinstall the skill)", 3)
     head, tail = m.group(1).split(BRIEF_SLOT)
+    return head, tail
+
+
+def reread_files(run: Path, nn: str) -> list[str] | None:
+    """The files of bundle NN the first Codex answer (stage3-codex-NN.md.codex.md) put in
+    `not_read`, in bundle order — what `brief --reread` sends again; None when that answer
+    or the bundle's file list cannot be read."""
+    first = run / f"stage3-codex-{nn}.md.codex.md"
+    got = _last_json_block(first.read_text(encoding="utf-8", errors="replace")) if first.is_file() else None
+    lists, _ = bundle_lists(run, load_manifest(run))
+    files = lists.get(f"bundle-{nn}.md") if lists else None
+    if not isinstance(got, dict) or not isinstance(got.get("not_read"), list) or files is None:
+        return None
+    unread = {str(x).split(": ", 1)[0].strip() for x in got["not_read"]}
+    return [f for f in files if f in unread]
+
+
+def brief_text(run: Path, nn: str, reread: bool = False) -> str | None:
+    """What a brief carries in its slot: bundle-NN.md's whole text, or, for a re-read, a
+    two-line head and the blocks of the files the first answer did not read, exactly as
+    bundle-NN.md holds them. None for a re-read with nothing to read again."""
+    if not reread:
+        return (run / "bundles" / f"bundle-{nn}.md").read_bytes().decode("utf-8")
+    files = reread_files(run, nn)
+    if not files:
+        return None
+    manifest = load_manifest(run)
+    ai = [e for e in manifest["entries"] if isinstance(e, dict) and e.get("ai")]  # type: ignore[union-attr]
+    lists, _ = bundle_lists(run, manifest)
+    assert lists is not None  # reread_files read them
+    names = list(lists)
+    first = sum(len(lists[n]) for n in names[: names.index(f"bundle-{nn}.md")])
+    count = len(lists[f"bundle-{nn}.md"])
+    blocks = [_bundle_block(run / "tree", e, first + k, len(ai)) for k, e in enumerate(ai[first : first + count], 1) if str(e["path"]) in files]
+    return (
+        f"# Upload set {manifest.get('digest')} — bundle {int(nn)}, read again: the {len(files)} file(s) the first answer did not read\n"
+        f"# {len(files)} file(s) in this part; read each one to its end.\n" + "".join(blocks)
+    )
+
+
+def codex_brief(run: Path, nn: str, mark: str, reread: bool = False) -> str | None:
+    """The Codex brief for bundle NN, as `brief` writes it: reference/briefs.md § Stage 3
+    with the digest and this brief's boundary value ``mark`` filled in and the bundle's
+    whole text (for a re-read, the files the first answer did not read) in its slot — the
+    instructions first, then the set, then the closing reminder."""
+    head, tail = _brief_template()
     digest = str(checked_manifest(run).get("digest"))
-    bundle = (run / "bundles" / f"bundle-{nn}.md").read_text(encoding="utf-8")
-    return head.replace("<DIGEST>", digest) + bundle + tail
+    text = brief_text(run, nn, reread)
+    if text is None:
+        return None
+    return head.replace("<DIGEST>", digest).replace(BRIEF_MARK, mark) + text + tail.replace(BRIEF_MARK, mark)
 
 
-def cmd_brief(run: Path, nn: str, check: Path | None) -> int:
-    """Write <run>/stage3-codex-NN.md (or, with --check, say whether a file is exactly it)."""
+def brief_is_exact(run: Path, nn: str, path: Path, reread: bool = False) -> bool:
+    """``path`` is exactly a brief `brief` writes for bundle NN: its boundary value is its
+    first boundary line's, the value occurs nowhere in the text of the set it carries, and
+    every byte is the template's with that value (bytes, not text: a text read would turn
+    a staged file's CR LF or lone CR into LF)."""
+    if not path.is_file():
+        return False
+    raw = path.read_bytes()
+    try:
+        got = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    m = BRIEF_MARK_RE.search(got)
+    text = brief_text(run, nn, reread) if m else None
+    expected = codex_brief(run, nn, m.group(1), reread) if m is not None and text is not None and m.group(1) not in text else None
+    return expected is not None and raw == expected.encode("utf-8")
+
+
+def cmd_brief(run: Path, nn: str, reread: bool, check: Path | None) -> int:
+    """Write <run>/stage3-codex-NN.md, or with --reread <run>/stage3-codex-NN-reread.md
+    (or, with --check, say whether a file is exactly such a brief)."""
     index = _json_file(run / "bundles" / "index.json")
     name = f"bundle-{nn}.md"
     bundles = index.get("bundles") if isinstance(index, dict) else None
@@ -913,52 +1046,49 @@ def cmd_brief(run: Path, nn: str, check: Path | None) -> int:
     if not isinstance(bundles, dict) or not path.is_file() or bundles.get(name) != sha256_file(path):
         print(f"BRIEF=refused: {name} is not a bundle this run indexed (run bundle first)")
         return 1
-    text = codex_brief(run, nn)
+    text = brief_text(run, nn, reread)
+    if text is None:
+        print(f"BRIEF=refused: stage3-codex-{nn}.md.codex.md is missing, unreadable or names no file of {name} in not_read: nothing to read again")
+        return 1
     if check is not None:
-        same = check.is_file() and check.read_text(encoding="utf-8", errors="replace") == text
+        same = brief_is_exact(run, nn, check, reread)
         print(f"BRIEF={'same' if same else 'differs'} {check}")
         return 0 if same else 1
-    out = run / f"stage3-codex-{nn}.md"
-    out.write_text(text, encoding="utf-8")
+    mark = secrets.token_hex(16)
+    while mark in text:  # a value the set's own text holds would not mark its end
+        mark = secrets.token_hex(16)
+    out = run / f"stage3-codex-{nn}{'-reread' if reread else ''}.md"
+    out.write_bytes((codex_brief(run, nn, mark, reread) or "").encode("utf-8"))
     print(f"BRIEF {out} ({out.stat().st_size:,} bytes)")
     return 0
 
 
 def codex_problems(run: Path, bundle_name: str) -> list[str]:
-    """Codex read this bundle: its brief `stage3-codex-NN.md` is exactly the one `brief`
-    writes (the instructions, the digest and the bundle's whole text), and its answer
-    `.codex.md` ends in a findings JSON block."""
+    """Codex read this bundle: its brief `stage3-codex-NN.md` is exactly one `brief`
+    writes (the instructions, the digest, a boundary value of its own and the bundle's
+    whole text), and its answer `.codex.md` ends in a findings JSON block naming every
+    file. A re-read (`stage3-codex-NN-reread.md`: the files the first answer did not
+    read), when there is one, is held to the same rules for its own files."""
     nn = bundle_name.removeprefix("bundle-").removesuffix(".md")
     brief, answer = run / f"stage3-codex-{nn}.md", run / f"stage3-codex-{nn}.md.codex.md"
-    if not brief.is_file() or brief.read_text(encoding="utf-8", errors="replace") != codex_brief(run, nn):
-        return [f"codex: {brief.name} missing, or not the brief `brief --run <run> --bundle {nn}` writes (the instructions, the digest and {bundle_name}'s whole text): write it so and run Codex again"]
+    if not brief_is_exact(run, nn, brief):
+        return [f"codex: {brief.name} missing, or not a brief `brief --run <run> --bundle {nn}` writes (the instructions, the digest and {bundle_name}'s whole text): write it so and run Codex again"]
     got = _last_json_block(answer.read_text(encoding="utf-8", errors="replace")) if answer.is_file() else None
     if not isinstance(got, dict) or not isinstance(got.get("findings"), list):
         return [f"codex: no answer with a findings JSON block ({answer.name})"]
-    index = _json_file(run / "bundles" / "index.json")
-    lists = index.get("files") if isinstance(index, dict) else None
-    files = lists.get(bundle_name) if isinstance(lists, dict) else None
-    if not isinstance(files, list) or not all(isinstance(f, str) for f in files):
-        return [f"codex: bundles/index.json lists no files for {bundle_name} (bundle again)"]
-    # The lists are the script's own, but checked, not trusted: together, in
-    # bundle-number order, they are the manifest's AI-readable files in order; and the
-    # bundle is exactly what `bundle` writes for its files (so a FILE-header-shaped
-    # line inside a file's text cannot stand in for a file the bundle lacks).
     manifest = _json_file(run / "manifest.json")
-    entries = manifest.get("entries") if isinstance(manifest, dict) else None
-    ai = [e for e in entries if isinstance(e, dict) and e.get("ai")] if isinstance(entries, list) else None
-    names = sorted(lists, key=_bundle_number)
-    bundles = index.get("bundles") if isinstance(index, dict) else None
-    # One list per bundle the index hashes (stage_problems holds those to the files on
-    # disk), numbered 1..n: a list for a bundle that does not exist would take its files
-    # out of every AI stage while the lists still add up to the manifest.
-    if not isinstance(bundles, dict) or set(bundles) != set(lists) or [_bundle_number(n) for n in names] != list(range(1, len(names) + 1)):
-        return ["codex: bundles/index.json's file lists are not one per bundle, numbered from 1 (bundle again)"]
-    listed = [str(f) for name in names if isinstance(lists[name], list) for f in lists[name]]
-    if not isinstance(manifest, dict) or ai is None or not all(isinstance(lists[n], list) for n in names) or listed != [str(e.get("path")) for e in ai]:
-        return ["codex: bundles/index.json's file lists are not the manifest's AI-readable files (bundle again)"]
+    lists, why = bundle_lists(run, manifest) if isinstance(manifest, dict) else (None, "manifest.json unreadable")
+    if lists is None or not isinstance(manifest, dict):
+        return [f"codex: {why}"]
+    if bundle_name not in lists:
+        return [f"codex: bundles/index.json lists no files for {bundle_name} (bundle again)"]
+    files = lists[bundle_name]
+    ai = [e for e in manifest["entries"] if isinstance(e, dict) and e.get("ai")]
+    names = list(lists)
     at = names.index(bundle_name)
     first = sum(len(lists[name]) for name in names[:at])
+    # The bundle is exactly what `bundle` writes for its files (so a FILE-header-shaped
+    # line inside a file's text cannot stand in for a file the bundle lacks).
     try:  # bytes, not text: read_text would turn a staged file's CR LF or lone CR into LF
         expected: bytes | None = (
             _bundle_head(manifest, at + 1, len(names), len(files))
@@ -968,7 +1098,23 @@ def codex_problems(run: Path, bundle_name: str) -> list[str]:
         expected = None
     if expected is None or (run / "bundles" / bundle_name).read_bytes() != expected:
         return [f"codex: {bundle_name} is not what `bundle` writes for the files bundles/index.json lists (bundle again)"]
-    return [f"codex: {p}" for p in answer_shape_problems(answer.name, got, files)]
+    problems = [f"codex: {p}" for p in answer_shape_problems(answer.name, got, files)]
+    again, again_answer = run / f"stage3-codex-{nn}-reread.md", run / f"stage3-codex-{nn}-reread.md.codex.md"
+    cleared = _json_file(run / "cleared.json")
+    resolved = cleared.get("resolved") if isinstance(cleared, dict) else None
+    claim = str(resolved.get(f"{answer.name}#not_read") or "") if isinstance(resolved, dict) else ""
+    if "reread" in claim and not (again.exists() and again_answer.exists()):
+        problems.append(f"codex: cleared.json says {answer.name}'s unread files were read again, but {again.name} or its answer is missing")
+    if again.exists() or again_answer.exists():
+        unread = reread_files(run, nn)
+        again_got = _last_json_block(again_answer.read_text(encoding="utf-8", errors="replace")) if again_answer.is_file() else None
+        if not unread or not brief_is_exact(run, nn, again, reread=True):
+            problems.append(f"codex: {again.name} is not the re-read `brief --run <run> --bundle {nn} --reread` writes for what {answer.name} did not read (write it again, or delete it and its answer)")
+        elif not isinstance(again_got, dict) or not isinstance(again_got.get("findings"), list):
+            problems.append(f"codex: no answer with a findings JSON block ({again_answer.name})")
+        else:
+            problems += [f"codex: {p}" for p in answer_shape_problems(again_answer.name, again_got, unread)]
+    return problems
 
 
 def ab_findings(run: Path, upto: str = "codex") -> list[str]:
@@ -1684,6 +1830,8 @@ def cmd_bundle(run: Path, max_bytes: int) -> int:
         index[path.name] = sha256_file(path)
         files[path.name] = paths[n - 1]
         print(f"BUNDLE {path} {len(blocks)} file(s) {path.stat().st_size:,} bytes")
+        if len(blocks) == 1 and len(blocks[0].encode()) > max_bytes:  # one file alone past the cap: a reader may leave part of it out
+            print(f"BUNDLE_OVERSIZE {path.name} {path.stat().st_size:,} bytes, over {max_bytes:,}: one file larger than the cap — count each answer's not_read and send what was not read again")
     # What the Codex and Grok stages must read, bound to the digest (grok_review.py checks it before sending).
     # `files`: the paths each bundle holds, which a Codex answer's read / not_read must name.
     (out_dir / "index.json").write_text(json.dumps({"digest": manifest.get("digest"), "bundles": index, "files": files}, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -1716,6 +1864,20 @@ def cmd_gate(run: Path, before: str) -> int:
         print(f"GATE=closed before {before}: {p}")
     if not problems:
         print(f"GATE=open before {before} {(run / 'DIGEST').read_text().strip()}")
+    # What each reader says it did not read, counted before its stage is accepted (after
+    # the GATE lines, so a caller that shows only the first lines still shows why).
+    answers = [(a.name, _json_file(a)) for a in sorted(run.glob("stage2-claude*.json"))]
+    answers += [(a.name, _last_json_block(a.read_text(encoding="utf-8", errors="replace"))) for a in sorted(run.glob("stage3-codex-*.md.codex.md"))]
+    for name, got in answers:
+        unread = got.get("not_read") if isinstance(got, dict) else None
+        if not isinstance(unread, list) or not unread:
+            continue
+        again = name.replace(".md.codex.md", "-reread.md.codex.md")
+        if name.startswith("stage3-codex-") and not name.endswith("-reread.md.codex.md"):
+            where = f"read again in {again}" if (run / again).is_file() else "send them again (brief --reread, SKILL.md Step 3)"
+        else:
+            where = "say in cleared.json who read them instead"
+        print(f"NOT_READ {name} {len(unread)} file(s) — {where}")
     return 1 if problems else 0
 
 
@@ -2870,11 +3032,12 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "brief":
         p.add_argument("--run", required=True, type=_abs_path)
         p.add_argument("--bundle", required=True, help="the bundle number NN of bundles/bundle-NN.md")
-        p.add_argument("--check", type=_abs_path, help="say whether this file is exactly the brief (writes nothing)")
+        p.add_argument("--reread", action="store_true", help="the files the first answer for this bundle did not read (stage3-codex-NN-reread.md)")
+        p.add_argument("--check", type=_abs_path, help="say whether this file is exactly such a brief (writes nothing)")
         a = p.parse_args(rest)
         if not re.fullmatch(r"[0-9]{2,4}", a.bundle):
             die("--bundle: the two-digit number of bundles/bundle-NN.md")
-        return cmd_brief(a.run, a.bundle, a.check)
+        return cmd_brief(a.run, a.bundle, a.reread, a.check)
     if cmd == "gate":
         p.add_argument("--run", required=True, type=_abs_path)
         p.add_argument("--before", required=True, choices=("codex", "grok"))

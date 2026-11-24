@@ -1,4 +1,4 @@
-# Claude Code skills
+# AgroDesign skills for Claude Code
 
 General-purpose [Claude Code](https://claude.com/claude-code) skills from AgroDesign Studios, used to prepare applications for publication on GitHub: a security check of exactly what is about to be published followed by the push, the switch to public and the release, each only after the owner's approval; and a comprehensive code review with a verdict that never passes what did not run.
 
@@ -32,10 +32,10 @@ The model pins at the time of writing — Claude Opus 5.5 for the Claude stages,
 Clone this repository and copy (or link) each skill folder into a skills folder Claude Code reads:
 
 ```bash
-git clone https://github.com/AgroDesign-Studios/claude-code-skills.git
+git clone https://github.com/AgroDesign-Studios/agrodesign-skills-for-claude-code.git
 mkdir -p ~/.claude/skills
-cp -R claude-code-skills/skills/agrodesign-github-publish ~/.claude/skills/      # for every project of this account
-cp -R claude-code-skills/skills/agrodesign-deep-review  <your repo>/.claude/skills/   # or for one project
+cp -R agrodesign-skills-for-claude-code/skills/agrodesign-github-publish ~/.claude/skills/      # for every project of this account
+cp -R agrodesign-skills-for-claude-code/skills/agrodesign-deep-review  <your repo>/.claude/skills/   # or for one project
 ```
 
 Then:
@@ -53,16 +53,18 @@ An application prepared with these skills records which ones it used and their v
 
 ```markdown
 ## How this release was checked
-Prepared with the Claude Code skills `agrodesign-github-publish` and `agrodesign-deep-review` from
-AgroDesign-Studios/claude-code-skills v0.1.0 (commit <full commit id>).
+Prepared with AgroDesign skills for Claude Code (`agrodesign-github-publish` and `agrodesign-deep-review`)
+from AgroDesign-Studios/agrodesign-skills-for-claude-code <release tag> (commit <full commit id>).
 ```
+
+This repository was named `claude-code-skills` until v0.1.1, which renamed it. GitHub forwards the old address to this one as long as no new repository takes the old name, and a record that names the old repository with v0.1.0 or its commit still identifies the same code.
 
 ## Run the tests
 
 The tests use made-up values only (stub `gitleaks`, `grok`, `codex` and `gh`, a local bare repository as the push destination, a local HTTP server as the anonymous API); nothing is sent anywhere.
 
 ```bash
-cd claude-code-skills
+cd agrodesign-skills-for-claude-code
 python3 -m unittest discover -s tests -v
 ```
 
@@ -70,7 +72,7 @@ The review-engine tests need Node.js, and the Codex-helper tests need Linux and 
 
 ## What the switch to public covers
 
-Making a repository public exposes its whole history, every branch and tag, issues, pull requests, releases, Actions logs and settings at once. `agrodesign-github-publish` switches only a repository made new, empty and private that has received nothing but pushes it sealed (staged with `--whole-history` and `--repo-meta`), after reading every ref, GitHub's activity log (no force pushes or deleted branches, whose commits stay fetchable), issue, pull request, release, tag, label, Pages site, wiki (and the wiki's own git repository) and Actions record and finding nothing unchecked; it reads them all again right after the switch and switches back to private if anything arrived in between. Any other repository — an old one with issues, a wiki, or pushes from elsewhere — is refused: make a new one and push the checked history to it. Switching back to private does not recall copies or forks made while it was public.
+Making a repository public exposes its whole history, every branch and tag, issues, pull requests, releases, Actions logs and settings at once. `agrodesign-github-publish` switches only a repository made new, empty and private that has received nothing but pushes it sealed (staged with `--whole-history` and `--repo-meta`), after reading every ref, GitHub's activity log (no force pushes or deleted branches, whose commits stay fetchable), issue, pull request, release, tag, label, Pages site, wiki (and the wiki's own git repository) and Actions record and finding nothing unchecked (a project in GitHub Projects keeps its own visibility and is not read); it reads them all again right after the switch and switches back to private if anything arrived in between. Any other repository — an old one with issues, a wiki, or pushes from elsewhere — is refused: make a new one and push the checked history to it. Switching back to private does not recall copies or forks made while it was public.
 
 ## Licence
 
